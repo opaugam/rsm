@@ -35,32 +35,32 @@ impl Node {
     }
 }
 
-pub struct FIFOLock {
+pub struct LIFOLock {
     tag: AtomicUsize,
     head: UnsafeCell<*mut Node>,
 }
 
-unsafe impl Send for FIFOLock {}
+unsafe impl Send for LIFOLock {}
 
-unsafe impl Sync for FIFOLock {}
+unsafe impl Sync for LIFOLock {}
 
-impl Default for FIFOLock {
+impl Default for LIFOLock {
     fn default() -> Self {
          Self::new()
     }
 }
 
-impl FIFOLock {
+impl LIFOLock {
     #[inline]
     pub fn new() -> Self {
-        FIFOLock::tagged_as(0)
+        LIFOLock::tagged_as(0)
     }
 
     #[inline]
     pub fn tagged_as(tag: u32) -> Self {
         let mut tag = tag as usize;
         tag <<= 32;
-        FIFOLock {
+        LIFOLock {
             tag: AtomicUsize::new(tag),
             head: UnsafeCell::new(ptr::null_mut()),
         }
@@ -109,7 +109,7 @@ impl FIFOLock {
                 false
             };
 
-            if FIFOLock::set_or_spin(&self.tag, 0, LOCK, LOCK, yield_and_give_up).is_none()
+            if LIFOLock::set_or_spin(&self.tag, 0, LOCK, LOCK, yield_and_give_up).is_none()
             {
                 //
                 // - the LOCK bit is still set in theory
@@ -119,7 +119,7 @@ impl FIFOLock {
                 //   to the first CAS (for instance if LOCK happens to be unset
                 //   now)
                 //
-                if FIFOLock::set_or_spin(&self.tag, LOCK, BUSY, BUSY | LIFO, |_| false).is_some() {
+                if LIFOLock::set_or_spin(&self.tag, LOCK, BUSY, BUSY | LIFO, |_| false).is_some() {
 
                     //
                     // - we are holding the BUSY bit, e.g we own the queue
@@ -196,7 +196,7 @@ impl FIFOLock {
         // - spin until we flip the BUSY bit on
         // - the LOCK bit is on by design and LIFO may also be set
         //
-        let tag = FIFOLock::set_or_spin(&self.tag, LOCK, BUSY, BUSY, |_| {
+        let tag = LIFOLock::set_or_spin(&self.tag, LOCK, BUSY, BUSY, |_| {
             thread::yield_now();
             true
         }).unwrap();
@@ -296,7 +296,7 @@ mod tests {
 
     extern crate rand;
 
-    use lock::FIFOLock;
+    use lock::LIFOLock;
     use lock::tests::rand::{Rng, thread_rng};
     use std::sync::Arc;
     use std::sync::atomic::spin_loop_hint;
@@ -304,7 +304,7 @@ mod tests {
 
     #[test]
     fn loop_32x4() {
-        let locks: Arc<Vec<_>> = Arc::new((0..4).map(|n| {FIFOLock::tagged_as(n)} ).collect());
+        let locks: Arc<Vec<_>> = Arc::new((0..4).map(|n| {LIFOLock::tagged_as(n)} ).collect());
         let mut threads = Vec::new();
         for _ in 0..32 {
             let locks = locks.clone();

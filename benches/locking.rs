@@ -4,12 +4,12 @@ extern crate lock;
 extern crate rand;
 
 use criterion::Criterion;
-use lock::lock::FIFOLock;
+use lock::lock::LIFOLock;
 use std::thread;
 use std::sync::Arc;
 
 fn lock_1k_fast_path() {
-    let lock = Arc::new(FIFOLock::new());
+    let lock = Arc::new(LIFOLock::new());
     for _ in 0..1000 {
         lock.lock();
         lock.unlock();
@@ -17,7 +17,7 @@ fn lock_1k_fast_path() {
 }
 
 fn lock_1k(size: usize) {
-    let lock = Arc::new(FIFOLock::new());
+    let lock = Arc::new(LIFOLock::new());
     let mut threads = Vec::new();
     for _ in 0..size {
         let lock = lock.clone();
