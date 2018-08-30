@@ -1,0 +1,22 @@
+[package]
+name = "rsm"
+version = "0.1.0"
+authors = ["Olivier Paugam <opaugam@gmail.com>"]
+
+[dependencies]
+rand = "0.5"
+
+[dev-dependencies]
+criterion = "0.2"
+
+[[bench]]
+name = "locking"
+harness = false
+
+[lib]
+name = "rsm"
+path = "src/lib.rs"
+
+[[bin]]
+name = "test"
+path = "src/bin/test.rs"
