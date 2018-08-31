@@ -8,11 +8,11 @@ use rsm::lock::*;
 use std::thread;
 use std::sync::Arc;
 
-fn fifo_lock_1k_fast_path() {
+fn fifo_lock_1k_fast() {
     let lock = Arc::new(Lock::<FIFO>::new());
     for _ in 0..1000 {
-        lock.lock();
-        lock.unlock();
+        lock.lock(|n| n);
+        lock.unlock(|n| n);
     }
 }
 
@@ -22,8 +22,8 @@ fn fifo_lock_1k(size: usize) {
     for _ in 0..size {
         let lock = lock.clone();
         let tid = thread::spawn(move || for _ in 0..1024 {
-            lock.lock();
-            lock.unlock();
+            lock.lock(|n| n);
+            lock.unlock(|n| n);
         });
         threads.push(tid);
     }
@@ -34,7 +34,7 @@ fn fifo_lock_1k(size: usize) {
 }
 
 fn benchmark(c: &mut Criterion) {
-    c.bench_function("lock (fifo, 1K fast path)", |b| b.iter(|| fifo_lock_1k_fast_path()));
+    c.bench_function("lock (fifo, 1K fast)", |b| b.iter(|| fifo_lock_1k_fast()));
     c.bench_function("lock (fifo, 1K X 4)", |b| b.iter(|| fifo_lock_1k(4)));
     //    c.bench_function("lock (1K X 16)", |b| b.iter(|| lock_1K(16)));
     //    c.bench_function("lock (1K X 128)", |b| b.iter(|| lock_1K(128)));
