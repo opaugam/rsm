@@ -4,10 +4,8 @@
 //! are awaken according to the specified strategy. The first cas loop is optimistic
 //! and will spin, attempting to flip the lock without going to sleep.
 //!
-//! The lock does not allow for strict barging in the sense that unlock() will use
-//! the cold path if ever there is at least one pending thread waiting. Micro contention
-//! will be handled however due to the initial spin (e.g 2 competing threads will not
-//! necessarily take the cold path).
+//! The locking/unlocking paths allow for barging, e.g lock preemption while in unlock().
+//! This allows to manage high micro-contention and minimizes calls to wait()/notify_one().
 //!
 //! The LIFO strategy is not fair in the sense 2+ threads could hog the lock. The
 //! FIFO strategy is fair and will guarantee each thread gets the same exposure.
@@ -134,7 +132,8 @@ where
             //
             // - attempt to spin and flip the LOCK bit
             // - failure after the initial period will proceed to enqueue/freeze the thread
-            // - pass the update closure to potentially update the user payload
+            // - pass the update closure to update the user payload should we succeed to
+            //   flip the bit
             //
             let yield_and_give_up = |_: &AtomicUsize| {
                 thread::yield_now();
@@ -169,7 +168,7 @@ where
                     BUSY,
                     BUSY | PENDING,
                     0,
-                    &update,
+                    &|n| n,
                     &|c| c + 1,
                     &|_| false,
                 ).is_some()
@@ -199,11 +198,9 @@ where
 
                     //
                     // - we got notified
-                    // - by design the LOCK bit must be set, e.g lock ownership
-                    //   was transferred to us
+                    // - in theory the LOCK bit must be unset
+                    // - loop back to flip it
                     //
-                    debug_assert!(self.tag.load(Ordering::Acquire) & LOCK > 0);
-                    break;
                 }
             } else {
                 break;
@@ -244,18 +241,29 @@ where
         F: Fn(u32) -> u32,
     {
         //
-        // - spin until we flip the BUSY bit on
-        // - the LOCK bit is on by design and PENDING may also be set
+        // - spin until we flip the BUSY bit on and unset the LOCK bit as the same time
+        // - this will effectively release the lock while we're clear to start fiddling
+        //   with the queue in case we have pending threads
         //
-        let cur = set_or_spin(&self.tag, LOCK, BUSY, BUSY, 0, &|n| n, &|c| c, &|_| {
+        let cur = set_or_spin(&self.tag, LOCK, BUSY, BUSY, LOCK, &|n| n, &|c| c, &|_| {
             thread::yield_now();
             true
         }).unwrap();
 
         //
-        // - we are holding the BUSY bit, e.g we own the queue
+        // - yield to promote preempting
+        // - this will reduce drastically the number of calls to wai() and favor
+        //   hot threads, typically during micro-contention
         //
-        if cur & PENDING > 0 {
+        thread::yield_now();
+
+        //
+        // - we are holding the BUSY bit, e.g we own the queue
+        // - LOCK has been unset but may have been preempted by another thread
+        //   running either lock() or lock_cold()
+        //
+        let preempted = self.tag.load(Ordering::Relaxed) & LOCK > 0;
+        if !preempted && (cur & PENDING > 0) {
 
             //
             // - dequeue one pending thread
@@ -266,14 +274,15 @@ where
             let mask = if last_one { BUSY | PENDING } else { BUSY };
 
             //
-            // - release the queue by unsetting the mask
+            // - release the queue by unsetting the mask (which could also
+            //   clear the PENDING bit if the queue is now empty)
             // - decrement the pending counter by 1
             // - pass the update closure to potentially update the user payload
             // - this should not spin unless upon a spurious CAS failure
             //
             let _ = set_or_spin(
                 &self.tag,
-                LOCK | BUSY,
+                BUSY,
                 0,
                 0,
                 mask,
@@ -284,8 +293,8 @@ where
 
             //
             // - lock the mutex and unset it
-            // - notify the condvar at which point the owning thread will be
-            //   scheduling again
+            // - notify the condvar at which point the corresponding thread will be
+            //   scheduling again (and attempt to acquire the lock in lock_cold())
             //
             let mut parked = synchro.0.lock().unwrap();
             *parked = false;
@@ -296,16 +305,16 @@ where
             //
             // - we just failed the first round of spinning
             // - there is no pending thread to transfer ownership to
-            // - unset both LOCK and BUSY
-            // - this should not spin unless upon a spurious CAS failure
+            // - unset the BUSY bit to release the queue
             // - pass the update closure to potentially update the user payload
+            // - this should not spin unless upon a spurious CAS failure
             //
             let _ = set_or_spin(
                 &self.tag,
-                LOCK | BUSY,
+                BUSY,
                 0,
                 0,
-                LOCK | BUSY,
+                BUSY,
                 &update,
                 &|c| c,
                 &|_| true,

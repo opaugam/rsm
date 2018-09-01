@@ -4,25 +4,19 @@ extern crate rsm;
 extern crate rand;
 
 use criterion::Criterion;
-use rsm::lock::*;
+use rsm::primitives::*;
+use rsm::primitives::lock::*;
 use std::thread;
 use std::sync::Arc;
 
-fn fifo_lock_1k_fast() {
-    let lock = Arc::new(Lock::<FIFO>::new());
-    for _ in 0..1000 {
-        lock.lock(|n| n);
-        lock.unlock(|n| n);
-    }
-}
-
-fn fifo_lock_1k(size: usize) {
-    let lock = Arc::new(Lock::<FIFO>::new());
+fn lock_1k_n<T: 'static + Strategy+Default>(lock: Lock<T>, n: usize, slow: bool) {
+    let lock = Arc::new(lock);
     let mut threads = Vec::new();
-    for _ in 0..size {
+    for _ in 0..n {
         let lock = lock.clone();
-        let tid = thread::spawn(move || for _ in 0..1024 {
+        let tid = thread::spawn(move || for _ in 0..1000 {
             lock.lock(|n| n);
+            if slow { thread::yield_now(); }
             lock.unlock(|n| n);
         });
         threads.push(tid);
@@ -34,12 +28,12 @@ fn fifo_lock_1k(size: usize) {
 }
 
 fn benchmark(c: &mut Criterion) {
-    c.bench_function("lock (fifo, 1K fast)", |b| b.iter(|| fifo_lock_1k_fast()));
-    c.bench_function("lock (fifo, 1K X 4)", |b| b.iter(|| fifo_lock_1k(4)));
-    //    c.bench_function("lock (1K X 16)", |b| b.iter(|| lock_1K(16)));
-    //    c.bench_function("lock (1K X 128)", |b| b.iter(|| lock_1K(128)));
-    //    c.bench_function("lock (1K X 512)", |b| b.iter(|| lock_1K(512)));
-}
+
+    let sizes = vec![1, 2, 8, 32, 128];
+    for n in sizes {
+        c.bench_function(&format!("lock (lifo, 1K X {})", n), move |b| b.iter(|| lock_1k_n(Lock::<LIFO>::new(), n, false)));
+        c.bench_function(&format!("lock (lifo [yield], 1K X {})", n), move |b| b.iter(|| lock_1k_n(Lock::<LIFO>::new(), n, true)));    
+    }}
 
 criterion_group!(benches, benchmark);
 criterion_main!(benches);

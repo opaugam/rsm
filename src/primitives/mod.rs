@@ -207,10 +207,10 @@ where
         // - attempt a CAS with the target value properly constructed
         //
         cnt = incr(cnt) << 8;
+        let target = (expected & !(unset | CNT_MSK | USR_MSK)) | ((payload as usize) << 32) | set | cnt;
         match state.compare_exchange_weak(
             expected,
-            (expected & !(unset | CNT_MSK | USR_MSK)) | ((payload as usize) << 32) | set |
-                cnt,
+            target,
             Ordering::Acquire,
             Ordering::Relaxed,
         ) {
@@ -262,7 +262,7 @@ mod tests {
                     for _ in 0..rng.gen_range(0, 40) {
                         spin_loop_hint();
                     }
-                    lock.unlock(|n| n);
+                    lock.unlock(|n| n - 1);
                 }
             });
             threads.push(tid);
@@ -272,12 +272,10 @@ mod tests {
             tid.join().unwrap();
         }
 
-        let mut total = 0;
         for lock in locks.iter() {
             assert!(lock.pending() == 0);
-            total += lock.tag();
+            assert!(lock.tag() == 0);
         }
-        assert!(total == 32 * 1024);
     }
 
     #[test]
@@ -294,7 +292,7 @@ mod tests {
                     for _ in 0..rng.gen_range(0, 40) {
                         spin_loop_hint();
                     }
-                    lock.unlock(|n| n);
+                    lock.unlock(|n| n - 1);
                 }
             });
             threads.push(tid);
@@ -304,12 +302,10 @@ mod tests {
             tid.join().unwrap();
         }
 
-        let mut total = 0;
         for lock in locks.iter() {
             assert!(lock.pending() == 0);
-            total += lock.tag();
+            assert!(lock.tag() == 0);
         }
-        assert!(total == 32 * 1024);
     }
 
     #[test]
@@ -324,7 +320,7 @@ mod tests {
             let lock = lock.clone();
             let tid = thread::spawn(move || {
                 lock.lock(|n| n + 1);
-                lock.unlock(|n| n);
+                lock.unlock(|n| n - 1);
                 then.run(|| sem.signal());
             });
             threads.push(tid);
@@ -332,6 +328,6 @@ mod tests {
     
         sem.wait();
         assert!(then.has_run());
-        assert!(lock.tag() == 512);
+        assert!(lock.tag() == 0);
     }
 }

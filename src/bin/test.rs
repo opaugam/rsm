@@ -15,16 +15,16 @@ fn main() {
 
     let lock = Arc::new(Lock::<FIFO>::new());
     let mut threads = Vec::new();
-    for t in 0..8 {
+    for t in 0..128 {
         let lock = lock.clone();
         let tid = thread::spawn(move || {
             let mut rng = thread_rng();
             loop {
                 lock.lock(|n| n + 1);
-                //for _ in 0..rng.gen_range(0, 5) {
-                //    spin_loop_hint();
-                //}
-                println!("#{} got the lock -> {}", t, lock.pending());
+                for _ in 0..rng.gen_range(0, 4096) {
+                    spin_loop_hint();
+                }
+                println!("#{} got the lock -> {}", t, lock.tag());
                 lock.unlock(|n| n - 1);
             }
         });
