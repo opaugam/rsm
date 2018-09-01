@@ -6,6 +6,6 @@
 #![deny(rust_2018_idioms)]
 #![deny(unused)]
 #![deny(unused_imports)]
-#[cfg_attr(feature = "cargo-clippy", allow(mutex_atomic,too_many_arguments))]
+#[cfg_attr(feature = "cargo-clippy", allow(mutex_atomic, too_many_arguments))]
 
 pub mod primitives;

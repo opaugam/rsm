@@ -225,7 +225,7 @@ where
         let cur = self.tag.load(Ordering::Relaxed);
         let user = update((cur >> 32) as u32);
         match self.tag.compare_exchange_weak(
-            (cur & !(PENDING | BUSY)) | LOCK,
+            (cur & !PENDING) | LOCK,
             (cur & !(LOCK | USR_MSK)) | ((user as usize) << 32),
             Ordering::Acquire,
             Ordering::Relaxed,
@@ -307,7 +307,7 @@ where
                 0,
                 LOCK | BUSY,
                 &update,
-                &|c| c - 1,
+                &|c| c,
                 &|_| true,
             );
         }

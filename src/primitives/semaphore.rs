@@ -38,8 +38,7 @@ unsafe impl Send for Semaphore {}
 
 unsafe impl Sync for Semaphore {}
 
-impl Default for Semaphore
-{
+impl Default for Semaphore {
     fn default() -> Self {
         Self::new()
     }
