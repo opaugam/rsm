@@ -4,7 +4,10 @@ use std::sync::{Arc, Mutex, Condvar};
 use std::sync::atomic::{AtomicUsize, Ordering, spin_loop_hint};
 
 pub mod countdown;
+pub mod event;
+pub mod gate;
 pub mod lock;
+pub mod once;
 pub mod semaphore;
 
 const CNT_MSK: usize = 0xFFFF_FF00;
@@ -179,7 +182,7 @@ pub fn set_or_spin<E, F, G>(
     user: &E,
     incr: &F,
     cold: &G,
-) -> Option<usize>
+) -> Result<usize, usize>
 where
     E: Fn(u32) -> u32,
     F: Fn(usize) -> usize,
@@ -207,21 +210,17 @@ where
         // - attempt a CAS with the target value properly constructed
         //
         cnt = incr(cnt) << 8;
-        let target = (expected & !(unset | CNT_MSK | USR_MSK)) | ((payload as usize) << 32) | set | cnt;
-        match state.compare_exchange_weak(
-            expected,
-            target,
-            Ordering::Acquire,
-            Ordering::Relaxed,
-        ) {
+        let target = (expected & !(unset | CNT_MSK | USR_MSK)) | ((payload as usize) << 32) |
+            set | cnt;
+        match state.compare_exchange_weak(expected, target, Ordering::Acquire, Ordering::Relaxed) {
             Ok(_) => {
-                return Some(expected | set);
+                return Ok(expected | set);
             }
             Err(prv) => {
                 cur = prv;
                 if n > 16 {
                     if !cold(state) {
-                        return None;
+                        return Err(cur);
                     }
                 } else {
                     for _ in 0..n {
@@ -240,94 +239,112 @@ mod tests {
     extern crate rand;
 
     use primitives::*;
-    use primitives::countdown::*;
+    use primitives::event::*;
+    use primitives::gate::*;
     use primitives::lock::*;
-    use primitives::semaphore::*;
+    use primitives::once::*;
     use primitives::tests::rand::{Rng, thread_rng};
     use std::sync::Arc;
     use std::sync::atomic::spin_loop_hint;
     use std::thread;
 
     #[test]
-    fn lifo_loop_32x4() {
-        let locks: Arc<Vec<_>> = Arc::new((0..4).map(|_| Lock::<LIFO>::new()).collect());
-        let mut threads = Vec::new();
-        for _ in 0..32 {
-            let locks = locks.clone();
-            let tid = thread::spawn(move || {
-                let mut rng = thread_rng();
-                for _ in 0..1024 {
-                    let lock = rng.choose(&locks).unwrap();
-                    lock.lock(|n| n + 1);
-                    for _ in 0..rng.gen_range(0, 40) {
-                        spin_loop_hint();
-                    }
-                    lock.unlock(|n| n - 1);
-                }
-            });
-            threads.push(tid);
-        }
+    fn synchro_event() {
 
-        for tid in threads {
-            tid.join().unwrap();
-        }
-
-        for lock in locks.iter() {
-            assert!(lock.pending() == 0);
-            assert!(lock.tag() == 0);
-        }
-    }
-
-    #[test]
-    fn fifo_loop_32x4() {
-        let locks: Arc<Vec<_>> = Arc::new((0..4).map(|_| Lock::<FIFO>::new()).collect());
-        let mut threads = Vec::new();
-        for _ in 0..32 {
-            let locks = locks.clone();
-            let tid = thread::spawn(move || {
-                let mut rng = thread_rng();
-                for _ in 0..1024 {
-                    let lock = rng.choose(&locks).unwrap();
-                    lock.lock(|n| n + 1);
-                    for _ in 0..rng.gen_range(0, 40) {
-                        spin_loop_hint();
-                    }
-                    lock.unlock(|n| n - 1);
-                }
-            });
-            threads.push(tid);
-        }
-
-        for tid in threads {
-            tid.join().unwrap();
-        }
-
-        for lock in locks.iter() {
-            assert!(lock.pending() == 0);
-            assert!(lock.tag() == 0);
-        }
-    }
-
-    #[test]
-    fn synchro_512() {
-        let sem = Arc::new(Semaphore::new());
-        let then = Arc::new(Countdown::new(512));
         let lock = Arc::new(Lock::<FIFO>::new());
-        let mut threads = Vec::new();
-        for _ in 0..512 {
-            let sem = sem.clone();
-            let then = then.clone();
-            let lock = lock.clone();
-            let tid = thread::spawn(move || {
-                lock.lock(|n| n + 1);
-                lock.unlock(|n| n - 1);
-                then.run(|| sem.signal());
-            });
-            threads.push(tid);
+        let event = Arc::new(Event::new());
+
+        {
+            let guard = event.guard();
+            for _ in 0..64 {
+
+                let lock = lock.clone();
+                let guard = guard.clone();
+                let _ = thread::spawn(move || {
+                    let mut rng = thread_rng();
+
+                    lock.lock(|n| n);
+                    for _ in 0..rng.gen_range(0, 40) {
+                        spin_loop_hint();
+                    }
+                    lock.unlock(|n| n + 1);
+
+                    drop(guard);
+                });
+            }
         }
-    
-        sem.wait();
-        assert!(then.has_run());
-        assert!(lock.tag() == 0);
+
+        event.wait();
+        assert!(lock.tag() == 64);
+        assert!(lock.pending() == 0);
+    }
+
+    #[test]
+    fn synchro_once() {
+
+        let event = Arc::new(Event::new());
+        let once = {
+            let event = event.clone();
+            Arc::new(Once::from(move || { event.signal(); }))
+        };
+
+        let _ = thread::spawn(move || { drop(once); });
+
+        event.wait();
+    }
+
+    #[test]
+    fn synchro_once_2() {
+
+        let lock = Arc::new(Lock::<FIFO>::new());
+        let event = Arc::new(Event::new());
+        let once = {
+            let lock = lock.clone();
+            Arc::new(Once::from(move || {
+                lock.lock(|n| n);
+                lock.unlock(|n| n + 1);
+            }))
+        };
+
+        {
+            let guard = event.guard();
+            for _ in 0..64 {
+
+                let once = once.clone();
+                let guard = guard.clone();
+                let _ = thread::spawn(move || {
+
+                    once.run();
+                    drop(guard);
+                });
+            }
+        }
+
+        event.wait();
+        assert!(lock.tag() == 1);
+    }
+
+    #[test]
+    fn synchro_gate() {
+        let gate = Arc::new(Gate::new());
+        let event = Arc::new(Event::new());
+
+        {
+            let guard = event.guard();
+            for _ in 0..64 {
+
+                let gate = gate.clone();
+                let guard = guard.clone();
+                let _ = thread::spawn(move || {
+
+                    gate.enter(|_| true);
+                    drop(guard);
+                });
+            }
+        }
+
+        gate.open();
+        event.wait();
+        assert!(gate.entries() == 64);
     }
 }

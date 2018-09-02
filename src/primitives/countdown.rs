@@ -13,7 +13,8 @@ use super::*;
 
 const BUSY: usize = 1;
 const DONE: usize = 2;
-const POISON: usize = 4;
+const RESET: usize = 4;
+const POISON: usize = 8;
 
 /// Countdown storing its state in a atomic usize. It has a positive count (maximum
 /// value of 16M) and is able to carry user payload (as a u32).
@@ -22,6 +23,10 @@ const POISON: usize = 4;
 /// is run after which the countdown is disabled. A panic in the closure will set
 /// the POISON bit at which point has_failed() would return true. Please note that
 /// the closure is run at most once with no retries (e.g even if it panics).
+///
+/// By default the countdown is reset (e.g won't run anything) and must be activated
+/// by incrementing it one or more times. When the counter transitions back from 1 to
+/// 0 upon invoking run() the closure will be run.
 ///
 /// The state usize is laid out as follows:
 ///
@@ -37,21 +42,14 @@ unsafe impl Sync for Countdown {}
 
 impl Countdown {
     #[inline]
-    pub fn new(count: usize) -> Self {
-
-        //
-        // - new() defaults to a 'once' construct
-        //
-        Countdown::with(count, 1)
+    pub fn new() -> Self {
+        Countdown::with(0)
     }
 
     #[inline]
-    pub fn with(count: usize, tag: u32) -> Self {
-        assert!(count >= 1);
-        let mut tag = tag as usize;
-        tag <<= 32;
-        tag |= (count - 1) << 8;
-        Countdown { tag: AtomicUsize::new(tag) }
+    pub fn with(tag: u32) -> Self {
+        let tag = tag as usize;
+        Countdown { tag: AtomicUsize::new(RESET | (tag << 32)) }
     }
 
     #[inline]
@@ -79,7 +77,35 @@ impl Countdown {
     }
 
     #[inline]
-    pub fn run<F>(&self, cb: F) -> ()
+    pub fn incr(&self) -> () {
+        loop {
+
+            //
+            // - attempt to update the counter if and only if BUSY/DONE are not set
+            // - make sure to unset the RESET bit
+            //
+            match set_or_spin(
+                &self.tag,
+                0,
+                BUSY | DONE,
+                0,
+                RESET,
+                &|n| n,
+                &|c| c + 1,
+                &|_| false,
+            ) {
+                Err(cur) => {
+                    if cur & DONE > 0 {
+                        break;
+                    }
+                }
+                _ => break,
+            }
+        }
+    }
+
+    #[inline]
+    pub fn run<F>(&self, f: &F) -> ()
     where
         F: Fn() -> (),
     {
@@ -95,11 +121,11 @@ impl Countdown {
         // - any failure defaults to the slow path
         //
         let cur = self.tag.load(Ordering::Relaxed);
-        if cur & DONE > 0 {
+        if cur & (RESET | DONE) > 0 {
             return;
         }
         let mut cnt = (cur & CNT_MSK) >> 8;
-        if cnt > 0 {
+        if cnt > 1 {
             cnt -= 1;
             match self.tag.compare_exchange_weak(
                 cur & !(DONE | BUSY),
@@ -110,20 +136,20 @@ impl Countdown {
                 Ok(_) => {}
                 Err(prv) => unsafe {
                     if prv & DONE == 0 {
-                        self.run_cold(cb);
+                        self.run_cold(f);
                     }
                 },
             }
         } else {
             unsafe {
-                self.run_cold(cb);
+                self.run_cold(f);
             }
         }
     }
 
     #[cold]
     #[inline(never)]
-    unsafe fn run_cold<F>(&self, cb: F) -> ()
+    unsafe fn run_cold<F>(&self, f: &F) -> ()
     where
         F: Fn() -> (),
     {
@@ -132,7 +158,7 @@ impl Countdown {
         // - spin until we flip the BUSY bit on
         // - the DONE bit may be set already
         //
-        let cur = set_or_spin(&self.tag, 0, BUSY, BUSY, 0, &|user| user, &|c| c, &|_| {
+        let cur = set_or_spin(&self.tag, 0, BUSY, BUSY, 0, &|n| n, &|c| c, &|_| {
             thread::yield_now();
             true
         }).unwrap();
@@ -141,7 +167,7 @@ impl Countdown {
         // - we are holding the BUSY bit
         //
         let cnt = (cur & CNT_MSK) >> 8;
-        if cnt > 0 {
+        if cnt > 1 {
 
             debug_assert!(cur & (DONE | POISON) == 0);
 
@@ -154,10 +180,10 @@ impl Countdown {
             let _ = set_or_spin(
                 &self.tag,
                 BUSY,
-                DONE | POISON,
+                DONE,
                 0,
                 BUSY,
-                &|user| user,
+                &|n| n,
                 &|c| c - 1,
                 &|_| true,
             );
@@ -174,6 +200,7 @@ impl Countdown {
 
             //
             // - run the closure
+            // - decrement the counter to 0
             // - finalize by setting the DONE bit
             // - unset the BUSY bit
             //
@@ -183,28 +210,19 @@ impl Countdown {
                     let _ = set_or_spin(
                         &self.0,
                         BUSY,
-                        DONE | POISON,
+                        DONE,
                         DONE | POISON,
                         BUSY,
-                        &|user| user,
-                        &|c| c,
+                        &|n| n,
+                        &|_| 0,
                         &|_| true,
                     );
                 }
             }
             let guard = _Guard(&self.tag);
-            cb();
+            f();
             mem::forget(guard);
-            let _ = set_or_spin(
-                &self.tag,
-                BUSY,
-                DONE | POISON,
-                DONE,
-                BUSY,
-                &|user| user,
-                &|c| c,
-                &|_| true,
-            );
+            let _ = set_or_spin(&self.tag, BUSY, DONE, DONE, BUSY, &|n| n, &|_| 0, &|_| true);
         }
     }
 }

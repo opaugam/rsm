@@ -149,7 +149,7 @@ where
                 &update,
                 &|c| c,
                 &yield_and_give_up,
-            ).is_none()
+            ).is_err()
             {
 
                 //
@@ -171,7 +171,7 @@ where
                     &|n| n,
                     &|c| c + 1,
                     &|_| false,
-                ).is_some()
+                ).is_ok()
                 {
 
                     //
@@ -245,7 +245,7 @@ where
         // - this will effectively release the lock while we're clear to start fiddling
         //   with the queue in case we have pending threads
         //
-        let cur = set_or_spin(&self.tag, LOCK, BUSY, BUSY, LOCK, &|n| n, &|c| c, &|_| {
+        let cur = set_or_spin(&self.tag, LOCK, BUSY, BUSY, LOCK, &update, &|c| c, &|_| {
             thread::yield_now();
             true
         }).unwrap();
@@ -280,16 +280,7 @@ where
             // - pass the update closure to potentially update the user payload
             // - this should not spin unless upon a spurious CAS failure
             //
-            let _ = set_or_spin(
-                &self.tag,
-                BUSY,
-                0,
-                0,
-                mask,
-                &update,
-                &|c| c - 1,
-                &|_| true,
-            );
+            let _ = set_or_spin(&self.tag, BUSY, 0, 0, mask, &|n| n, &|c| c - 1, &|_| true);
 
             //
             // - lock the mutex and unset it
@@ -309,16 +300,7 @@ where
             // - pass the update closure to potentially update the user payload
             // - this should not spin unless upon a spurious CAS failure
             //
-            let _ = set_or_spin(
-                &self.tag,
-                BUSY,
-                0,
-                0,
-                BUSY,
-                &update,
-                &|c| c,
-                &|_| true,
-            );
+            let _ = set_or_spin(&self.tag, BUSY, 0, 0, BUSY, &|n| n, &|c| c, &|_| true);
         }
     }
 }

@@ -101,7 +101,7 @@ impl Semaphore {
         //
         let cur = self.tag.load(Ordering::Relaxed);
         let mut cnt = (cur & CNT_MSK) >> 8;
-        if cnt == cap {
+        if cnt == cap && cur & OPEN > 0 {
             return;
         }
         cnt += 1;
@@ -177,7 +177,6 @@ impl Semaphore {
             // - we can now set the OPEN bit since the counter is now > 0
             // - this should not spin unless upon a spurious CAS failure
             //
-            println!("open on");
             let _ = set_or_spin(
                 &self.tag,
                 BUSY,
