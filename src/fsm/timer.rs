@@ -8,7 +8,7 @@ use std::sync::{Arc, Condvar, Mutex, Weak};
 use std::thread;
 use std::time::{Duration, Instant};
 
-pub enum CMD<T>
+pub enum Command<T>
 where
     T: Send + 'static,
 {
@@ -27,20 +27,20 @@ impl Default for State {
     }
 }
 
-use self::CMD::*;
+use self::Command::*;
 
 //
 // - number of hashed wheel slots
-// - our clock frequency is 25ms, our granularity is 64ms: pick 256 
+// - our clock frequency is 25ms, our granularity is 64ms: pick 256
 // - note this must be a power of 2
 //
-const SLOTS: usize = 1<<8;
+const SLOTS: usize = 1 << 8;
 
 pub struct Clock<T>
 where
     T: Send + 'static,
 {
-    fsm: Arc<Automaton<CMD<T>>>,
+    fsm: Arc<Automaton<Command<T>>>,
 }
 
 struct Slot<T>
@@ -72,7 +72,7 @@ where
 
 impl<T> Ord for Pending<T>
 where
-   T: Send + 'static,
+    T: Send + 'static,
 {
     fn cmp(&self, other: &Self) -> Ordering {
         self.tick.cmp(&other.tick).reverse()
@@ -81,29 +81,38 @@ where
 
 impl<T> PartialOrd for Pending<T>
 where
-   T: Send + 'static,
+    T: Send + 'static,
 {
-    fn partial_cmp(&self, other: &Self) -> Option<Ordering> { Some(self.cmp(other)) }
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
 }
 
 impl<T> PartialEq for Pending<T>
 where
-   T: Send + 'static,
+    T: Send + 'static,
 {
-    fn eq(&self, other: &Self) -> bool { (self.n, self.tick) == (other.n, other.tick) }
+    fn eq(&self, other: &Self) -> bool {
+        (self.n, self.tick) == (other.n, other.tick)
+    }
 }
 
 impl<T> Eq for Pending<T>
 where
-   T: Send + 'static,
+    T: Send + 'static,
 {
 }
 
-impl<T> Recv<CMD<T>, State> for Inner<T>
+impl<T> Recv<Command<T>, State> for Inner<T>
 where
     T: Send + 'static,
 {
-    fn recv(&mut self, _this: &Arc<Automaton<CMD<T>>>, state: State, opcode: Opcode<CMD<T>>) -> State {
+    fn recv(
+        &mut self,
+        _this: &Arc<Automaton<Command<T>>>,
+        state: State,
+        opcode: Opcode<Command<T>>,
+    ) -> State {
         match (state, opcode) {
             (_, Opcode::INPUT(TICK)) => {
 
@@ -119,7 +128,7 @@ where
                     let ref mut slot = self.slots[self.n];
                     loop {
                         match slot.heap.peek() {
-                            Some(item) if item.tick <= ms => {},
+                            Some(item) if item.tick <= ms => {}
                             _ => break,
                         }
                         let pending = slot.heap.pop().unwrap();
@@ -128,9 +137,9 @@ where
                         }
                     }
 
-                    self.n = (self.n + 1) & (SLOTS-1);
+                    self.n = (self.n + 1) & (SLOTS - 1);
                 }
-            },
+            }
             (_, Opcode::INPUT(SCHEDULE(to, msg, lapse))) => {
 
                 let (n, ms) = self.tick_to_slot(Instant::now() + lapse);
@@ -164,7 +173,7 @@ where
         let lapse = tick - self.epoch;
         let ms = (1e3 * (lapse.as_secs() as f64 + lapse.subsec_nanos() as f64 * 1e-9)) as u64;
         let n = (ms >> 6) as usize;
-        (n & (SLOTS-1), ms)
+        (n & (SLOTS - 1), ms)
     }
 }
 
@@ -183,11 +192,14 @@ where
             })
             .collect();
 
-        let fsm = Automaton::spawn(guard.clone(), Box::new(Inner {
-              n: 0,
-              epoch: Instant::now(),
-             slots
-             }));
+        let fsm = Automaton::spawn(
+            guard.clone(),
+            Box::new(Inner {
+                n: 0,
+                epoch: Instant::now(),
+                slots,
+            }),
+        );
 
         {
             //
@@ -220,7 +232,7 @@ where
     }
 
     pub fn schedule(&self, to: Arc<Automaton<T>>, msg: T, lapse: Duration) -> () {
-        let _ = self.fsm.post(CMD::SCHEDULE(to, msg, lapse));
+        let _ = self.fsm.post(Command::SCHEDULE(to, msg, lapse));
     }
 }
 

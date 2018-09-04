@@ -65,15 +65,17 @@ impl Gate {
     }
 
     #[inline]
-    pub fn enter<F>(&self, f: F) -> ()
+    pub fn enter<F>(&self, f: F) -> bool
     where
         F: Fn(u32) -> bool,
     {
         self.lock.lock(|n| n + 1);
         if f(self.lock.tag()) {
             self.lock.unlock(|n| n);
+            true
         } else {
             self.closed.store(true, Ordering::Release);
+            false
         }
     }
 }

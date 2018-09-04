@@ -15,57 +15,40 @@ use rsm::primitives::event::*;
 use rand::{Rng, thread_rng};
 use std::sync::Arc;
 use std::sync::atomic::spin_loop_hint;
+use std::time::Duration;
+
+fn random_work(spins: usize) -> () {
+    let mut rng = thread_rng();
+    for _ in 0..rng.gen_range(0, spins) {
+        spin_loop_hint();
+    }
+}
 
 fn main() {
 
+        let gate = Arc::new(Gate::new());
+        let event = Arc::new(Event::new());
+        for _ in 0..64 {
 
-    #[derive(Debug)]
-    enum CMD {
-        PING,
-    }
+            let gate = gate.clone();
+            let event = event.clone();
+            let _ = thread::spawn(move || {
 
-    #[derive(Debug, Copy, Clone)]
-    enum State {
-        RESET,
-    }
-
-    impl Default for State {
-        fn default() -> State {
-            State::RESET
+                random_work(40);
+                gate.enter(|n| if n == 8 {
+                    event.signal();
+                    false
+                } else {
+                    true
+                });
+            });
         }
-    }
 
-    struct A {
-        cnt: usize,
-    }
-
-    impl Recv<CMD, State> for A {
-        fn recv(&mut self, this: &Automaton<CMD>, state: State, opcode: Opcode<CMD>) -> State {
-            self.cnt += 1;
-            println!("#{}", self.cnt);
-            if self.cnt > 8 {
-                this.drain();
-            }
-            state
+        gate.open();
+        for _ in 0..8 {
+            event.wait();
+            assert!(gate.entries() == 8);
+            gate.open();
         }
-    }
 
-    let event = Event::new();
-    let guard = event.guard();
-    let fsm = Automaton::spawn(guard.clone(), Box::new(A { cnt: 0 }));
-    let clock = Clock::<CMD>::spawn(guard.clone());
-
-    {
-        let fsm = fsm.clone();
-        let guard = guard.clone();
-        thread::spawn(move || {
-            while fsm.post(CMD::PING).is_ok() {
-            }
-            drop(guard);
-        });
-    }
-
-    drop(guard);
-    clock.drain();
-    event.wait();
 }

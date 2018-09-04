@@ -366,12 +366,8 @@ mod tests {
             let _ = thread::spawn(move || {
 
                 random_work(40);
-                gate.enter(|n| if n == 8 {
-                    event.signal();
-                    false
-                } else {
-                    true
-                });
+                let open = gate.enter(|n| n < 8);
+                if !open { event.signal(); }
             });
         }
 

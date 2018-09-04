@@ -1,4 +1,5 @@
-//! Also check out http://www.1024cores.net/home/lock-free-algorithms/queues for more interesting ideas.
+//! Basic MPSC queue. Also check out http://www.1024cores.net/home/lock-free-algorithms/queues
+//! for more interesting ideas.
 use std::boxed::Box;
 use std::cell::UnsafeCell;
 use std::ptr;
