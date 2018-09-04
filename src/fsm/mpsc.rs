@@ -1,3 +1,4 @@
+//! Also check out http://www.1024cores.net/home/lock-free-algorithms/queues for more interesting ideas.
 use std::boxed::Box;
 use std::cell::UnsafeCell;
 use std::ptr;
@@ -11,25 +12,16 @@ pub enum Errors {
 
 use self::Errors::*;
 
-//
-// - the queue is a linked list growing to the left and shrinking from the right
-// - the option is required to represent the empty marker
-//
 struct Node<T> {
+    //
+    // - the queue is a linked list growing to the left and shrinking from the right
+    // - the option is required to represent the empty marker
+    //
     prv: AtomicPtr<Node<T>>,
     val: Option<T>,
 }
 
-///
-/// Basic unbounded MPSC FIFO queue.
-///
-///            head <- node <- ... <- tail
-/// push() ->   x
-///                                     x -> pop()
-///
-/// Also check out http://www.1024cores.net/home/lock-free-algorithms/queues for more
-/// interesting ideas.
-///
+/// Basic unbounded MPSC FIFO queue backed up by one atomic pointer + raw pointer.
 pub struct MPSC<T> {
     head: AtomicPtr<Node<T>>,
     tail: UnsafeCell<*mut Node<T>>,
@@ -50,7 +42,9 @@ impl<T> Node<T> {
 // - pop() *must* only ever be used by one thread at a time
 //
 unsafe impl<T: Send> Send for MPSC<T> {}
+
 unsafe impl<T: Send> Sync for MPSC<T> {}
+
 impl<T> Drop for MPSC<T> {
     fn drop(&mut self) {
         unsafe {

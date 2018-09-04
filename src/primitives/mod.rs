@@ -248,6 +248,13 @@ mod tests {
     use std::sync::atomic::spin_loop_hint;
     use std::thread;
 
+    fn random_work(spins: usize) -> () {
+        let mut rng = thread_rng();
+        for _ in 0..rng.gen_range(0, spins) {
+            spin_loop_hint();
+        }
+    }
+
     #[test]
     fn synchro_event() {
 
@@ -261,12 +268,9 @@ mod tests {
                 let lock = lock.clone();
                 let guard = guard.clone();
                 let _ = thread::spawn(move || {
-                    let mut rng = thread_rng();
 
                     lock.lock(|n| n);
-                    for _ in 0..rng.gen_range(0, 40) {
-                        spin_loop_hint();
-                    }
+                    random_work(40);
                     lock.unlock(|n| n + 1);
 
                     drop(guard);
@@ -326,6 +330,7 @@ mod tests {
 
     #[test]
     fn synchro_gate() {
+
         let gate = Arc::new(Gate::new());
         let event = Arc::new(Event::new());
 
@@ -346,5 +351,35 @@ mod tests {
         gate.open();
         event.wait();
         assert!(gate.entries() == 64);
+    }
+
+
+    #[test]
+    fn synchro_gate_2() {
+
+        let gate = Arc::new(Gate::new());
+        let event = Arc::new(Event::new());
+        for _ in 0..64 {
+
+            let gate = gate.clone();
+            let event = event.clone();
+            let _ = thread::spawn(move || {
+
+                random_work(40);
+                gate.enter(|n| if n == 8 {
+                    event.signal();
+                    false
+                } else {
+                    true
+                });
+            });
+        }
+
+        gate.open();
+        for _ in 0..8 {
+            event.wait();
+            assert!(gate.entries() == 8);
+            gate.open();
+        }
     }
 }

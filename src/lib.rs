@@ -8,4 +8,5 @@
 #![deny(unused_imports)]
 #[cfg_attr(feature = "cargo-clippy", allow(mutex_atomic, too_many_arguments))]
 
+pub mod fsm;
 pub mod primitives;

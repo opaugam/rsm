@@ -20,10 +20,6 @@ pub struct Gate {
     closed: AtomicBool,
 }
 
-unsafe impl Send for Gate {}
-
-unsafe impl Sync for Gate {}
-
 impl Default for Gate {
     fn default() -> Self {
         Self::new()

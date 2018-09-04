@@ -93,21 +93,25 @@ impl Semaphore {
     pub fn signal_under(&self, cap: usize) -> () {
 
         //
+        // - fast fail if we have reached the cap and
+        //   if we are open
+        //
+        let cur = self.tag.load(Ordering::Relaxed);
+        let cnt = (cur & CNT_MSK) >> 8;
+        if cnt == cap && cur & OPEN > 0 {
+            return;
+        }
+
+        //
         // - fast signal path (load + CAS)
         // - attempt to increment the counter bits if and only if the
         //   BUSY and CLOSED bits are not set (e.g we're either reset or
         //   open and nobody is locking the queue)
         // - any failure defaults to the slow path
         //
-        let cur = self.tag.load(Ordering::Relaxed);
-        let mut cnt = (cur & CNT_MSK) >> 8;
-        if cnt == cap && cur & OPEN > 0 {
-            return;
-        }
-        cnt += 1;
         match self.tag.compare_exchange_weak(
             (cur & !(BUSY | CLOSED)) | OPEN,
-            (cur & !CNT_MSK) | (cnt << 8),
+            (cur & !CNT_MSK) | ((cnt + 1) << 8),
             Ordering::Acquire,
             Ordering::Relaxed,
         ) {
@@ -139,7 +143,8 @@ impl Semaphore {
             //
             // - dequeue one pending thread
             // - if this is the last pending queue node we have to
-            //   unset the CLOSED bit
+            //   unset the CLOSED bit at which point the semaphore will
+            //   be reset (counter == 0)
             //
             let (last_one, synchro) = self.queue.pop();
             let mask = if last_one { BUSY | CLOSED } else { BUSY };
@@ -198,17 +203,15 @@ impl Semaphore {
         // - attempt to decrement the counter bits if and only if the
         //   BUSY bit is not set, the OPEN bit is (e.g we're open and
         //   nobody is locking the queue)
-        // - if count is dropping to zero default to the slow path
-        // - if we detect a zero count before the CAS default to the slow path
+        // - if count is dropping to zero use the slow path to remove the OPEN bit
         // - any failure defaults to the slow path
         //
         let cur = self.tag.load(Ordering::Relaxed);
-        let mut cnt = (cur & CNT_MSK) >> 8;
-        if cnt > 0 {
-            cnt -= 1;
+        let cnt = (cur & CNT_MSK) >> 8;
+        if cnt > 1 {
             match self.tag.compare_exchange_weak(
                 (cur & !BUSY) | OPEN,
-                (cur & !CNT_MSK) | (cnt << 8),
+                (cur & !CNT_MSK) | ((cnt - 1) << 8),
                 Ordering::Acquire,
                 Ordering::Relaxed,
             ) {
