@@ -41,7 +41,7 @@ pub trait Recv<T, U>: Send
 where
     T: Send,
 {
-    fn recv(&mut self, this: &Automaton<T>, state: U, opcode: Opcode<T>) -> U;
+    fn recv(&mut self, this: &Arc<Automaton<T>>, state: U, opcode: Opcode<T>) -> U;
 }
 
 /// Automaton (e.g finite state machine) maintaining an incoming queue of commands
@@ -98,7 +98,8 @@ where
                 //
                 fsm.event.wait();
                 let mut draining = false;
-                let mut state = body.recv(&fsm, Default::default(), START);
+                let mut state = Default::default();
+                let _ = body.recv(&fsm, state, START);
                 loop {
 
                     //
