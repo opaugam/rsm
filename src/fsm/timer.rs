@@ -36,11 +36,11 @@ use self::Command::*;
 //
 const SLOTS: usize = 1 << 8;
 
-pub struct Clock<T>
+pub struct Timer<T>
 where
     T: Send + 'static,
 {
-    fsm: Arc<Automaton<Command<T>>>,
+    pub fsm: Arc<Automaton<Command<T>>>,
 }
 
 struct Slot<T>
@@ -51,7 +51,7 @@ where
     heap: BinaryHeap<Pending<T>>,
 }
 
-struct Inner<T>
+struct FSM<T>
 where
     T: Send + 'static,
 {
@@ -103,7 +103,7 @@ where
 {
 }
 
-impl<T> Recv<Command<T>, State> for Inner<T>
+impl<T> Recv<Command<T>, State> for FSM<T>
 where
     T: Send + 'static,
 {
@@ -158,7 +158,7 @@ where
     }
 }
 
-impl<T> Inner<T>
+impl<T> FSM<T>
 where
     T: Send + 'static,
 {
@@ -177,11 +177,11 @@ where
     }
 }
 
-impl<T> Clock<T>
+impl<T> Timer<T>
 where
     T: Send + 'static,
 {
-    pub fn spawn(guard: Arc<Guard>) -> Clock<T> {
+    pub fn spawn(guard: Arc<Guard>) -> Timer<T> {
 
         let slots = (0..SLOTS)
             .map(|_| {
@@ -194,7 +194,7 @@ where
 
         let fsm = Automaton::spawn(
             guard.clone(),
-            Box::new(Inner {
+            Box::new(FSM {
                 n: 0,
                 epoch: Instant::now(),
                 slots,
@@ -228,7 +228,7 @@ where
             });
         }
 
-        Clock { fsm }
+        Timer { fsm }
     }
 
     pub fn schedule(&self, to: Arc<Automaton<T>>, msg: T, lapse: Duration) -> () {
@@ -236,7 +236,7 @@ where
     }
 }
 
-impl<T> Drop for Clock<T>
+impl<T> Drop for Timer<T>
 where
     T: Send + 'static,
 {

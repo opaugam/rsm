@@ -1,4 +1,3 @@
-
 pub mod automaton;
 pub mod mpsc;
 pub mod timer;
@@ -33,11 +32,16 @@ mod tests {
     #[test]
     fn basic_lifecycle() {
         struct FSM {
-            cnt: usize
+            cnt: usize,
         }
 
         impl Recv<Command, State> for FSM {
-            fn recv(&mut self, _this: &Arc<Automaton<Command>>, state: State, _opcode: Opcode<Command>) -> State {
+            fn recv(
+                &mut self,
+                _this: &Arc<Automaton<Command>>,
+                state: State,
+                _opcode: Opcode<Command>,
+            ) -> State {
                 self.cnt += 1;
                 state
             }
@@ -61,14 +65,19 @@ mod tests {
     fn terminate_in_250ms() {
 
         struct FSM {
-            clock: Clock<Command>,
+            timer: Timer<Command>,
         }
 
         impl Recv<Command, State> for FSM {
-            fn recv(&mut self, this: &Arc<Automaton<Command>>, state: State, opcode: Opcode<Command>) -> State {
+            fn recv(
+                &mut self,
+                this: &Arc<Automaton<Command>>,
+                state: State,
+                opcode: Opcode<Command>,
+            ) -> State {
                 match (state, opcode) {
                     (_, Opcode::START) => {
-                        self.clock.schedule(
+                        self.timer.schedule(
                             this.clone(),
                             Command::TERMINATE,
                             Duration::from_millis(250),
@@ -85,8 +94,8 @@ mod tests {
 
         let event = Event::new();
         let guard = event.guard();
-        let clock = Clock::<Command>::spawn(guard.clone());
-        let _ = Automaton::spawn(guard.clone(), Box::new(FSM { clock }));
+        let timer = Timer::<Command>::spawn(guard.clone());
+        let _ = Automaton::spawn(guard.clone(), Box::new(FSM { timer }));
         drop(guard);
         event.wait();
     }

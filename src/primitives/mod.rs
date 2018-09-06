@@ -367,7 +367,9 @@ mod tests {
 
                 random_work(40);
                 let open = gate.enter(|n| n < 8);
-                if !open { event.signal(); }
+                if !open {
+                    event.signal();
+                }
             });
         }
 

@@ -7,6 +7,13 @@
 #![deny(unused)]
 #![deny(unused_imports)]
 #[cfg_attr(feature = "cargo-clippy", allow(mutex_atomic, too_many_arguments))]
+//extern crate serde;
+#[macro_use]
+extern crate serde_derive;
+extern crate serde_json;
+#[macro_use]
+extern crate slog;
 
 pub mod fsm;
 pub mod primitives;
+pub mod protocol;

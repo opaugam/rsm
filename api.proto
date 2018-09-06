@@ -1,0 +1,13 @@
+syntax = "proto3";
+
+package node;
+
+message Empty {}
+
+message Packet {
+    string json         = 1;
+}
+
+service Node {
+  rpc process (Packet) returns (Empty) {}
+}
