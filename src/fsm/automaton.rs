@@ -24,9 +24,12 @@ pub enum Errors {
 }
 
 #[derive(Debug)]
-pub enum Opcode<T> {
+pub enum Opcode<T, U> 
+where U: PartialEq
+{
     START,
     INPUT(T),
+    TRANSITION(U),
     DRAIN,
     EXIT,
 }
@@ -40,8 +43,9 @@ use self::Opcode::*;
 pub trait Recv<T, U>: Send
 where
     T: Send,
+    U: PartialEq
 {
-    fn recv(&mut self, this: &Arc<Automaton<T>>, state: U, opcode: Opcode<T>) -> U;
+    fn recv(&mut self, this: &Arc<Automaton<T>>, state: U, opcode: Opcode<T, U>) -> U;
 }
 
 /// Automaton (e.g finite state machine) maintaining an incoming queue of commands
@@ -65,7 +69,7 @@ where
     #[inline]
     pub fn spawn<U>(guard: Arc<Guard>, body: Box<dyn Recv<T, U>>) -> Arc<Automaton<T>>
     where
-        U: Send + Copy + Default + 'static,
+        U: Send + Copy + Default + PartialEq + 'static,
     {
         let fsm = Automaton::with(guard, body);
         fsm.start();
@@ -75,7 +79,7 @@ where
     #[inline]
     pub fn with<U>(guard: Arc<Guard>, mut body: Box<dyn Recv<T, U>>) -> Arc<Automaton<T>>
     where
-        U: Send + Copy + Default + 'static,
+        U: Send + Copy + Default + PartialEq + 'static,
     {
         let fsm = Arc::new(Automaton {
             inbox: MPSC::new(),
@@ -113,9 +117,20 @@ where
 
                         //
                         // - we dequeued the next command
-                        // - recv() on INPUT and update the state
+                        // - recv() on INPUT and optional on TRANSITION if the
+                        //   state is deemed differnt (see below)
                         //
-                        state = body.recv(&fsm, state, INPUT(msg));
+                        let next = body.recv(&fsm, state, INPUT(msg));
+                        if next != state {
+                            body.recv(&fsm, next, TRANSITION(state));
+                        }
+
+                        //
+                        // - assign the state (please note it could implement
+                        //   PartialEq and be different in reality, espcially if
+                        //   it carries some internal payload)
+                        //
+                        state = next;
 
                     } else if draining {
 

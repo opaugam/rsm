@@ -1,5 +1,5 @@
 pub mod messages;
-pub mod replica;
+pub mod topology;
 
 #[cfg(test)]
 mod tests {}

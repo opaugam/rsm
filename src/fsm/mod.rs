@@ -16,7 +16,7 @@ mod tests {
         TERMINATE,
     }
 
-    #[derive(Debug, Copy, Clone)]
+    #[derive(Debug, Copy, Clone, PartialEq)]
     enum State {
         DEFAULT,
     }
@@ -40,7 +40,7 @@ mod tests {
                 &mut self,
                 _this: &Arc<Automaton<Command>>,
                 state: State,
-                _opcode: Opcode<Command>,
+                _opcode: Opcode<Command, State>,
             ) -> State {
                 self.cnt += 1;
                 state
@@ -73,7 +73,7 @@ mod tests {
                 &mut self,
                 this: &Arc<Automaton<Command>>,
                 state: State,
-                opcode: Opcode<Command>,
+                opcode: Opcode<Command, State>,
             ) -> State {
                 match (state, opcode) {
                     (_, Opcode::START) => {

@@ -13,8 +13,9 @@ extern crate slog_async;
 extern crate slog_term;
 
 use rsm::primitives::event::*;
-use rsm::protocol::messages::RAW;
-use rsm::protocol::replica::*;
+use rsm::raft::messages::RAW;
+use rsm::raft::messages::Command::MESSAGE;
+use rsm::raft::topology::*;
 use serde_json::Value;
 use slog::{Drain, Logger};
 use slog_term::{FullFormat, PlainSyncDecorator};
@@ -38,7 +39,6 @@ fn main() {
         (version: env!("CARGO_PKG_VERSION"))
         (@arg ID: --id +takes_value "local id")
         (@arg HOST: --host +takes_value "local host:port")
-        (@arg SEEDS: --seeds +takes_value "comma separated host:port list")
         (@arg CHDIR: -c --chdir +takes_value "chdir directory")
     ).get_matches();
 
@@ -61,22 +61,21 @@ fn main() {
     let guard = event.guard();
 
     //
-    // - grab our node id and seeds
-    // - start the replication state machine
+    // - grab our node id and local host
+    // - start a global timer
+    // - start the cluster membership state machine
     //
     let id = value_t!(args, "ID", u8).unwrap();
     let host = value_t!(args, "HOST", String).unwrap();
-    let seeds = value_t!(args, "SEEDS", String).ok();
-    let replica = Replica::spawn(
+    let topology = Topology::spawn(
         guard.clone(),
         id,
         host,
-        seeds,
-        root.new(o!("sys" => "replica", "id" => id)),
+        root.new(o!("sys" => "topo", "id" => id)),
     );
 
     {
-        let fsm = replica.fsm.clone();
+        let fsm = topology.fsm.clone();
         let _ = thread::spawn(move || {
 
             //
@@ -94,7 +93,7 @@ fn main() {
                             // - forward to the state machine
                             //
                             let raw: RAW = serde_json::from_str(&line).unwrap();
-                            let _ = fsm.post(Command::MESSAGE(raw));
+                            let _ = fsm.post(MESSAGE(raw));
                         }
                     }
                     _ => {}
@@ -104,10 +103,10 @@ fn main() {
     }
 
     //
-    // - trap SIGINT/SIGTERM and drain the replica automaton
-    // - the automaton will signal the termination event upon going down
+    // - trap SIGINT/SIGTERM and drain the state machine
+    // - the state machine will signal the termination event upon going down
     //
-    ctrlc::set_handler(move || { replica.fsm.drain(); }).unwrap();
+    ctrlc::set_handler(move || { topology.fsm.drain(); }).unwrap();
 
     //
     // - block on the termination event

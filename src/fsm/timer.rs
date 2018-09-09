@@ -16,7 +16,7 @@ where
     SCHEDULE(Arc<Automaton<T>>, T, Duration),
 }
 
-#[derive(Copy, Clone)]
+#[derive(Copy, Clone, PartialEq)]
 enum State {
     DEFAULT,
 }
@@ -111,7 +111,7 @@ where
         &mut self,
         _this: &Arc<Automaton<Command<T>>>,
         state: State,
-        opcode: Opcode<Command<T>>,
+        opcode: Opcode<Command<T>, State>,
     ) -> State {
         match (state, opcode) {
             (_, Opcode::INPUT(TICK)) => {
@@ -124,7 +124,7 @@ where
                 //   is expired) and post the attached payload
                 //
                 let (until, ms) = self.tick_to_slot(Instant::now());
-                while self.n < until {
+                while self.n != until {
                     let ref mut slot = self.slots[self.n];
                     loop {
                         match slot.heap.peek() {

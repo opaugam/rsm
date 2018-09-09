@@ -4,11 +4,8 @@ use std::fmt;
 
 macro_rules! declare {
     ($code:expr, $msg:ident) => {
-
         impl $msg {
-            
             pub const CODE: u8 = $code;
-            
             pub fn to_raw(&self, src: &str, dst: &str) -> RAW {
                 RAW {
                     code: $msg::CODE,
@@ -38,11 +35,44 @@ impl fmt::Display for RAW {
     }
 }
 
-/// Heartbeat message used to advertise the local state.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct PING {
     pub id: u8,
-    pub term: u32,
+    pub term: u64,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct UPGRADE {
+    pub id: u8,
+    pub term: u64,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct CHECK {
+    pub id: u8,
+    pub term: u64,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ADVERTISE {
+    pub id: u8,
+    pub term: u64,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct VOTE {
+    pub id: u8,
+    pub term: u64,
 }
 
 declare!(1, PING);
+declare!(2, UPGRADE);
+declare!(3, CHECK);
+declare!(4, ADVERTISE);
+declare!(5, VOTE);
+
+pub enum Command {
+    MESSAGE(RAW),
+    TIMEOUT(u64),
+    HEARTBEAT,
+}

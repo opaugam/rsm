@@ -27,7 +27,7 @@ if __name__ == "__main__":
 
         for line in iter(pid.stdout.readline,''):
             line = line[:-1]
-            print('grpc out -> sending %dB "%s"' % (len(line), line))
+            #print('grpc out -> sending %dB "%s"' % (len(line), line))
             try:
 
                 js = json.loads(line)
@@ -36,7 +36,8 @@ if __name__ == "__main__":
                 stub.process(api_pb2.Packet(json=line))
         
             except Exception as failure:
-                print 'failed to send %s (%s)' % (line, failure)
+                pass
+                #print 'failed to send %s (%s)' % (line, failure)
 
     try:
 
