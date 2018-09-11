@@ -3,6 +3,10 @@
 //! condition variable to park/unpark threads. The internal queueing is done in LIFO
 //! order. The cost per sempahore is 16 bytes (state + 1 pointer).
 //!
+//! The semaphore also offers a disable() method to fast fail both wait() and signal()
+//! while waking up any pending thread. This can be useful to flush a blocking queue
+//! where consumers pop one item at a time for instance.
+//!
 //! Please note each lock may carry 32bits of user payload.
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::thread;
@@ -11,6 +15,7 @@ use super::*;
 const BUSY: usize = 1;
 const OPEN: usize = 2;
 const CLOSED: usize = 4;
+const DEAD: usize = 8;
 
 /// Semaphore storing its state in a atomic usize and maintaining a LIFO parking
 /// queue. The semaphore has a positive count (maximum value of 16M) and is able
@@ -85,6 +90,47 @@ impl Semaphore {
     }
 
     #[inline]
+    pub fn disable(&self) -> () {
+
+        //
+        // - if the DEAD bit is already set fast-fail
+        // - otehrwise run a CAS loop to set it
+        //
+        let mut cur = self.tag.load(Ordering::Relaxed);
+        if cur & DEAD > 0 { 
+            return;
+        }
+
+        loop {
+            match self.tag.compare_exchange_weak(
+                cur,
+                cur | DEAD,
+                Ordering::Acquire,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => break,
+                Err(prv) => {
+                    cur = prv;
+                }
+            }
+        }
+
+        //
+        // - once set and if we are closed (e.g we have pending threads) invoke signal_cold()
+        //   as many times as necessary (in any case past the CAS no other thread will be able
+        //   to wait() and therefore increment the count)
+        //
+        if cur & CLOSED > 0 {
+            let n = (cur & CNT_MSK) >> 8;
+            unsafe {
+                for _ in 0..n {
+                    self.signal_cold();
+                }
+            }
+        }
+    }
+
+    #[inline]
     pub fn signal(&self) -> () {
         self.signal_under(CNT_MSK >> 8)
     }
@@ -93,12 +139,12 @@ impl Semaphore {
     pub fn signal_under(&self, cap: usize) -> () {
 
         //
-        // - fast fail if we have reached the cap and
-        //   if we are open
+        // - fast fail if we have reached the cap and if we are open
+        // - fast fail if the DEAD bit is set (e.g we are disabled)
         //
         let cur = self.tag.load(Ordering::Relaxed);
         let cnt = (cur & CNT_MSK) >> 8;
-        if cnt == cap && cur & OPEN > 0 {
+        if cur & DEAD > 0 || (cnt == cap && cur & OPEN > 0) {
             return;
         }
 
@@ -200,6 +246,7 @@ impl Semaphore {
 
         //
         // - fast wait path (load + CAS)
+        // - fast fail if the DEAD bit is set (e.g we are disabled)
         // - attempt to decrement the counter bits if and only if the
         //   BUSY bit is not set, the OPEN bit is (e.g we're open and
         //   nobody is locking the queue)
@@ -207,6 +254,9 @@ impl Semaphore {
         // - any failure defaults to the slow path
         //
         let cur = self.tag.load(Ordering::Relaxed);
+        if cur & DEAD > 0 {
+            return;
+        }
         let cnt = (cur & CNT_MSK) >> 8;
         if cnt > 1 {
             match self.tag.compare_exchange_weak(

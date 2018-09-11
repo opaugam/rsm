@@ -12,11 +12,13 @@
 //!                                <---------------+
 //! ```
 //!
-//!  * Capacity:
+//!  # Capacity:
+//!  This implementation offers the following upper bounds:
 //!     - up to 64 peers
 //!     - up to 4000G terms
 //!     - log up to 65K entries
 //!
+//!  # Impementation notes
 //!  * In case of replication conflict the follower will ask the leader to rewind using a simple
 //!    exponential backoff potentially down to the first offset.
 //!
@@ -28,8 +30,10 @@
 //! * [Original paper.](https://raft.github.io/raft.pdf)
 //! * [Optimizations.](http://openlife.cc/system/files/3-modifications-for-Raft-consensus.pdf)
 use fsm::automaton::{Automaton, Opcode, Recv};
+use fsm::mpsc::MPSC;
 use fsm::timer::Timer;
 use primitives::event::*;
+use primitives::semaphore::*;
 use raft::messages::*;
 use rand::{Rng, thread_rng};
 use serde_json;
@@ -39,6 +43,44 @@ use std::collections::HashMap;
 use std::fmt;
 use std::sync::Arc;
 use std::time::Duration;
+
+/// Events emitted by the state machine. Those are available for the user to react
+/// to membership changes, commits, etc.
+#[derive(Debug)]
+pub enum Notification {
+    FOLLOWING,
+    LEADING,
+    COMMIT(String),
+    EXIT,
+}
+
+/// Simple blocking notification sink consuming from a MPSC. Once signaled with no
+/// content the sink will disable itself and always fail.
+pub struct Sink {
+    sem: Semaphore,
+    fifo: MPSC<Notification>,
+}
+
+impl Sink {
+    #[allow(dead_code)]
+    pub fn next(&self) -> Option<Notification> {
+
+        //
+        // - wait/pop, this will fast-fail on None as soon as we disable the semaphore, e.g
+        //   when the state-machine exits
+        //
+        self.sem.wait();
+        self.fifo.pop().ok()
+    }
+
+    fn new() -> Self {
+
+        Sink {
+            sem: Semaphore::new(),
+            fifo: MPSC::new(),
+        }
+    }
+}
 
 /// Volatile information maintained while on a given state, typically who we voted
 /// for, who the leader is, etc.
@@ -135,25 +177,33 @@ struct Peer {
     ack: u16,
 }
 
-// term on u48
-// index on u16 (65k entries)
-
-struct FSM {
+//@note voted for should be persisted
+struct FSM<F>
+where
+    F: 'static + Send + Fn(String) -> (),
+{
+    /// Local peer index in [0, 64]
     id: u8,
     host: String,
+    /// Sequence counter, used to disambiguiate timeouts
     seq: u64,
+    /// Current term, persisted
     term: u64,
+    /// Current log tail (e.g term|offset of the last log entry, 0 if empty)
     tail: u64,
+    /// Commit offset
     commit: u16,
     peers: HashMap<u8, Peer>,
     timer: Timer<Command>,
     log: Vec<LogEntry>,
+    sink: Arc<Sink>,
+    write: F,
     logger: Logger,
 }
 
 macro_rules! pretty {
     ($self:ident, $fmt:expr $(, $arg:expr)*) => {
-        info!(&$self.logger, $fmt, $($arg),* ;
+        debug!(&$self.logger, $fmt, $($arg),* ;
             "term" => $self.term,
             "log" => $self.log.len(),
             "commit" => $self.commit);
@@ -172,7 +222,10 @@ macro_rules! unpack {
     };
 }
 
-impl FSM {
+impl<F> FSM<F>
+where
+    F: 'static + Send + Fn(String) -> (),
+{
     const LIVENESS_TIMEOUT: u64 = 3000;
     const ELECTION_TIMEOUT: u64 = 250;
 
@@ -195,7 +248,10 @@ impl FSM {
     }
 }
 
-impl Recv<Command, State> for FSM {
+impl<F> Recv<Command, State> for FSM<F>
+where
+    F: Send + Fn(String) -> (),
+{
     fn recv(
         &mut self,
         this: &Arc<Automaton<Command>>,
@@ -208,7 +264,7 @@ impl Recv<Command, State> for FSM {
                 //
                 // - fake a cluster setup with 3 nodes on localhost
                 //
-                for n in 0..3 {
+                for n in 0..5 {
                     self.peers.insert(
                         n,
                         Peer {
@@ -226,11 +282,11 @@ impl Recv<Command, State> for FSM {
                 self.timer.schedule(
                     this.clone(),
                     TIMEOUT(self.seq),
-                    Duration::from_millis(FSM::LIVENESS_TIMEOUT),
+                    Duration::from_millis(FSM::<F>::LIVENESS_TIMEOUT),
                 );
             }
             Opcode::TRANSITION(prv) => {
-                assert!(state != prv);
+                debug_assert!(state != prv);
                 self.seq += 1;
                 match (prv, state) {
                     (CNDT(_), PREV(ref ctx)) |
@@ -275,9 +331,13 @@ impl Recv<Command, State> for FSM {
 
                         //
                         // - replicate immediately
+                        // - notify the sink with LEADING
+                        // - increment the sink semaphore
                         //
                         self.seq += 1;
                         let _ = this.post(TIMEOUT(self.seq));
+                        self.sink.fifo.push(Notification::LEADING);
+                        self.sink.sem.signal();
 
                         for n in 0..32 {
                             let _ = this.post(STORE(format!("blob #{}", n)));
@@ -288,6 +348,13 @@ impl Recv<Command, State> for FSM {
                     (LEAD(_), FLWR(ctx)) => {
 
                         //
+                        // - notify the sink with FOLLOWING
+                        // - increment the sink semaphore
+                        //
+                        self.sink.fifo.push(Notification::FOLLOWING);
+                        self.sink.sem.signal();
+
+                        //
                         // - we got a REPLICATE with a higher term
                         // - set our next timeout
                         //
@@ -295,11 +362,11 @@ impl Recv<Command, State> for FSM {
                         self.timer.schedule(
                             this.clone(),
                             TIMEOUT(self.seq),
-                            Duration::from_millis(FSM::LIVENESS_TIMEOUT),
+                            Duration::from_millis(FSM::<F>::LIVENESS_TIMEOUT),
                         );
                     }
                     _ => {
-                        assert!(false, "invalid state transition");
+                        debug_assert!(false, "invalid state transition");
                     }
                 }
             }
@@ -323,7 +390,7 @@ impl Recv<Command, State> for FSM {
                                     term: self.term + 1,
                                     tail: self.tail,
                                 };
-                                println!("{}", msg.to_raw(&self.host, &peer.1.host));
+                                (self.write)(format!("{}", msg.to_raw(&self.host, &peer.1.host)));
                             }
                         }
 
@@ -335,7 +402,7 @@ impl Recv<Command, State> for FSM {
                         self.timer.schedule(
                             this.clone(),
                             TIMEOUT(self.seq),
-                            Duration::from_millis(FSM::ELECTION_TIMEOUT),
+                            Duration::from_millis(FSM::<F>::ELECTION_TIMEOUT),
                         );
                     }
                     CNDT(ref mut ctx) => {
@@ -364,7 +431,7 @@ impl Recv<Command, State> for FSM {
                                     term: self.term,
                                     tail: self.tail,
                                 };
-                                println!("{}", msg.to_raw(&self.host, &peer.1.host));
+                                (self.write)(format!("{}", msg.to_raw(&self.host, &peer.1.host)));
                             }
                         }
 
@@ -376,7 +443,7 @@ impl Recv<Command, State> for FSM {
                         self.timer.schedule(
                             this.clone(),
                             TIMEOUT(self.seq),
-                            Duration::from_millis(FSM::ELECTION_TIMEOUT),
+                            Duration::from_millis(FSM::<F>::ELECTION_TIMEOUT),
                         );
 
                     }
@@ -392,7 +459,7 @@ impl Recv<Command, State> for FSM {
                             self.timer.schedule(
                                 this.clone(),
                                 TIMEOUT(self.seq),
-                                Duration::from_millis(FSM::LIVENESS_TIMEOUT),
+                                Duration::from_millis(FSM::<F>::LIVENESS_TIMEOUT),
                             );
 
                         } else {
@@ -423,9 +490,9 @@ impl Recv<Command, State> for FSM {
                                 // - check if we need to replicate
                                 //
                                 let mut append = Vec::new();
-                                assert!(end >= peer.1.ack);
-                                assert!(end >= peer.1.off);
-                                assert!(peer.1.off >= peer.1.ack);
+                                debug_assert!(end >= peer.1.ack);
+                                debug_assert!(end >= peer.1.off);
+                                debug_assert!(peer.1.off >= peer.1.ack);
                                 if end > peer.1.off {
 
                                     //
@@ -472,7 +539,7 @@ impl Recv<Command, State> for FSM {
                                     append,
                                 };
 
-                                println!("{}", msg.to_raw(&self.host, &peer.1.host));
+                                (self.write)(format!("{}", msg.to_raw(&self.host, &peer.1.host)));
                             }
                         }
 
@@ -484,7 +551,7 @@ impl Recv<Command, State> for FSM {
                         self.timer.schedule(
                             this.clone(),
                             TIMEOUT(self.seq),
-                            Duration::from_millis(FSM::LIVENESS_TIMEOUT / 3),
+                            Duration::from_millis(FSM::<F>::LIVENESS_TIMEOUT / 3),
                         );
                     }
                 }
@@ -534,7 +601,7 @@ impl Recv<Command, State> for FSM {
                                 id: self.id,
                                 term: self.term,
                             };
-                            println!("{}", msg.to_raw(&self.host, &raw.src));
+                            (self.write)(format!("{}", msg.to_raw(&self.host, &raw.src)));
 
                         } else {
                             match state {
@@ -563,15 +630,24 @@ impl Recv<Command, State> for FSM {
                                     self.term = msg.term;
 
                                     //
+                                    // - notify the sink with a COMMIT for each entry
                                     // - update our commit offset up to the leader's offset
+                                    // - increment the sink semaphore
                                     //
                                     //   "If leaderCommit > commitIndex, set commitIndex =
                                     //    min(leaderCommit, index of last new entry)"
                                     //
                                     let end = self.log.len() as u16;
                                     if msg.commit > self.commit {
-                                        self.commit = cmp::min(msg.commit, end);
-                                        pretty!(self, "{:?} commit #{}", ctx, self.commit);
+                                        let updated = cmp::min(msg.commit, end);
+                                        pretty!(self, "{:?} commit now at #{}", ctx, updated);
+                                        for n in self.commit..updated {
+                                            self.sink.fifo.push(Notification::COMMIT(
+                                                self.log[n as usize].blob.clone(),
+                                            ));
+                                            self.sink.sem.signal();
+                                        }
+                                        self.commit = updated;
                                     }
 
                                     //
@@ -620,7 +696,9 @@ impl Recv<Command, State> for FSM {
                                                 ack: self.log.len() as u16,
                                             };
 
-                                            println!("{}", msg.to_raw(&self.host, &raw.src));
+                                            (self.write)(
+                                                format!("{}", msg.to_raw(&self.host, &raw.src)),
+                                            );
                                         }
 
                                     } else {
@@ -633,7 +711,7 @@ impl Recv<Command, State> for FSM {
                                         //   the LEADER to go back in the log with increasingly
                                         //   large steps
                                         //
-                                        assert!(off > 0);
+                                        debug_assert!(off > 0);
                                         let rewind = cmp::min(1 << ctx.conflicts, off);
                                         ctx.conflicts += 1;
                                         pretty!(
@@ -651,7 +729,9 @@ impl Recv<Command, State> for FSM {
                                             try: off - rewind,
                                         };
 
-                                        println!("{}", msg.to_raw(&self.host, &raw.src));
+                                        (self.write)(
+                                            format!("{}", msg.to_raw(&self.host, &raw.src)),
+                                        );
                                     }
                                 }
                                 LEAD(ref ctx) => {
@@ -667,7 +747,7 @@ impl Recv<Command, State> for FSM {
                                     //   revert to FOLLOWER
                                     //
                                     self.term = msg.term;
-                                    assert!(msg.term > self.term || self.peers.len() >> 1 == 1);
+                                    debug_assert!(msg.term > self.term || self.peers.len() >> 1 == 1);
                                     pretty!(self, "{:?} stepping down", ctx);
                                     return FLWR(context::FLWR {
                                         live: true,
@@ -690,7 +770,7 @@ impl Recv<Command, State> for FSM {
                                 id: self.id,
                                 term: self.term,
                             };
-                            println!("{}", msg.to_raw(&self.host, &raw.src));
+                            (self.write)(format!("{}", msg.to_raw(&self.host, &raw.src)));
 
                         } else {
                             match state {
@@ -746,12 +826,24 @@ impl Recv<Command, State> for FSM {
 
                                     //
                                     // - do we have quorum ?
-                                    // - if yes update our commit offset to the smallest replicated
-                                    //   offset reported by the quorum peers
                                     //
                                     if n > self.peers.len() >> 1 {
-                                        self.commit = smallest;
                                         pretty!(self, "{:?} commit #{}", ctx, smallest);
+
+                                        //
+                                        // - notify the sink with a COMMIT for each entry
+                                        // - update our commit offset to the smallest replicated
+                                        //   offset reported by the quorum peers
+                                        // - signal the sink event
+                                        //
+                                        debug_assert!(smallest > 0);
+                                        for n in self.commit..smallest {
+                                            self.sink.fifo.push(Notification::COMMIT(
+                                                self.log[n as usize].blob.clone(),
+                                            ));
+                                            self.sink.sem.signal();
+                                        }
+                                        self.commit = smallest;
                                     }
                                 }
                                 _ => {}
@@ -770,7 +862,7 @@ impl Recv<Command, State> for FSM {
                                 id: self.id,
                                 term: self.term,
                             };
-                            println!("{}", msg.to_raw(&self.host, &raw.src));
+                            (self.write)(format!("{}", msg.to_raw(&self.host, &raw.src)));
 
                         } else {
                             match state {
@@ -791,7 +883,7 @@ impl Recv<Command, State> for FSM {
                                         msg.id,
                                         msg.try
                                     );
-                                    assert!(msg.try < peer.off);
+                                    debug_assert!(msg.try < peer.off);
                                     peer.ack = cmp::min(peer.ack, msg.try);
                                     peer.off = msg.try;
 
@@ -817,7 +909,7 @@ impl Recv<Command, State> for FSM {
                                 id: self.id,
                                 term: self.term,
                             };
-                            println!("{}", msg.to_raw(&self.host, &raw.src));
+                            (self.write)(format!("{}", msg.to_raw(&self.host, &raw.src)));
 
                         } else {
                             match state {
@@ -836,7 +928,9 @@ impl Recv<Command, State> for FSM {
                                             id: self.id,
                                             term: self.term,
                                         };
-                                        println!("{}", msg.to_raw(&self.host, &raw.src));
+                                        (self.write)(
+                                            format!("{}", msg.to_raw(&self.host, &raw.src)),
+                                        );
                                     }
                                 }
                                 _ => {}
@@ -855,7 +949,7 @@ impl Recv<Command, State> for FSM {
                                 id: self.id,
                                 term: self.term,
                             };
-                            println!("{}", msg.to_raw(&self.host, &raw.src));
+                            (self.write)(format!("{}", msg.to_raw(&self.host, &raw.src)));
                         } else {
                             match state {
                                 CNDT(ref mut ctx) |
@@ -897,7 +991,9 @@ impl Recv<Command, State> for FSM {
                                             term: self.term,
                                         };
 
-                                        println!("{}", msg.to_raw(&self.host, &raw.src));
+                                        (self.write)(
+                                            format!("{}", msg.to_raw(&self.host, &raw.src)),
+                                        );
                                     }
                                 }
                                 _ => {}
@@ -916,7 +1012,7 @@ impl Recv<Command, State> for FSM {
                                 id: self.id,
                                 term: self.term,
                             };
-                            println!("{}", msg.to_raw(&self.host, &raw.src));
+                            (self.write)(format!("{}", msg.to_raw(&self.host, &raw.src)));
                         } else {
                             match state {
                                 PREV(ref mut ctx) => {
@@ -957,6 +1053,16 @@ impl Recv<Command, State> for FSM {
             Opcode::DRAIN => {
                 warn!(&self.logger, "draining");
             }
+            Opcode::EXIT => {
+
+                //
+                // - send a last notification to our sink
+                // - disable the sink semaphore which will force the consuming thread to pop
+                //   all pending notifications and then move on
+                //
+                self.sink.fifo.push(Notification::EXIT);
+                self.sink.sem.disable();
+            }
             _ => {}
         };
         state
@@ -964,8 +1070,18 @@ impl Recv<Command, State> for FSM {
 }
 
 impl Protocol {
-    pub fn spawn(guard: Arc<Guard>, id: u8, host: String, logger: Logger) -> Protocol {
+    pub fn spawn<F>(
+        guard: Arc<Guard>,
+        id: u8,
+        host: String,
+        write: F,
+        logger: Logger,
+    ) -> (Self, Arc<Sink>)
+    where
+        F: 'static + Send + Fn(String) -> (),
+    {
 
+        let sink = Arc::new(Sink::new());
         let fsm = Automaton::spawn(
             guard.clone(),
             Box::new(FSM {
@@ -978,11 +1094,13 @@ impl Protocol {
                 peers: HashMap::new(),
                 timer: Timer::spawn(guard.clone()),
                 log: Vec::new(),
+                sink: sink.clone(),
+                write,
                 logger,
             }),
         );
 
-        Protocol { fsm }
+        (Protocol { fsm }, sink)
     }
 }
 
