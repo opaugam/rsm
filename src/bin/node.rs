@@ -4,8 +4,6 @@ extern crate clap;
 extern crate ctrlc;
 extern crate rand;
 extern crate rsm;
-#[macro_use]
-extern crate serde_derive;
 extern crate serde_json;
 #[macro_use]
 extern crate slog;
@@ -15,8 +13,7 @@ extern crate slog_term;
 use rsm::primitives::event::*;
 use rsm::raft::messages::RAW;
 use rsm::raft::messages::Command::MESSAGE;
-use rsm::raft::topology::*;
-use serde_json::Value;
+use rsm::raft::protocol::Protocol;
 use slog::{Drain, Logger};
 use slog_term::{FullFormat, PlainSyncDecorator};
 use slog_async::Async;
@@ -67,15 +64,15 @@ fn main() {
     //
     let id = value_t!(args, "ID", u8).unwrap();
     let host = value_t!(args, "HOST", String).unwrap();
-    let topology = Topology::spawn(
+    let protocol = Protocol::spawn(
         guard.clone(),
         id,
         host,
-        root.new(o!("sys" => "topo", "id" => id)),
+        root.new(o!("sys" => "raft", "id" => id)),
     );
 
     {
-        let fsm = topology.fsm.clone();
+        let fsm = protocol.fsm.clone();
         let _ = thread::spawn(move || {
 
             //
@@ -106,7 +103,7 @@ fn main() {
     // - trap SIGINT/SIGTERM and drain the state machine
     // - the state machine will signal the termination event upon going down
     //
-    ctrlc::set_handler(move || { topology.fsm.drain(); }).unwrap();
+    ctrlc::set_handler(move || { protocol.fsm.drain(); }).unwrap();
 
     //
     // - block on the termination event

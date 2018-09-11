@@ -35,10 +35,33 @@ impl fmt::Display for RAW {
     }
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LogEntry {
+    pub term: u64,
+    pub blob: String,
+}
+
 #[derive(Debug, Serialize, Deserialize)]
-pub struct PING {
+pub struct REPLICATE {
     pub id: u8,
     pub term: u64,
+    pub check: u64,
+    pub commit: u16,
+    pub append: Vec<LogEntry>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct CONFIRM {
+    pub id: u8,
+    pub term: u64,
+    pub ack: u16,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct CONFLICT {
+    pub id: u8,
+    pub term: u64,
+    pub try: u16,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -51,12 +74,14 @@ pub struct UPGRADE {
 pub struct CHECK {
     pub id: u8,
     pub term: u64,
+    pub tail: u64,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct ADVERTISE {
     pub id: u8,
     pub term: u64,
+    pub tail: u64,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -65,14 +90,17 @@ pub struct VOTE {
     pub term: u64,
 }
 
-declare!(1, PING);
-declare!(2, UPGRADE);
-declare!(3, CHECK);
-declare!(4, ADVERTISE);
-declare!(5, VOTE);
+declare!(1, REPLICATE);
+declare!(2, CONFIRM);
+declare!(3, CONFLICT);
+declare!(4, UPGRADE);
+declare!(5, CHECK);
+declare!(6, ADVERTISE);
+declare!(7, VOTE);
 
 pub enum Command {
     MESSAGE(RAW),
+    STORE(String),
     TIMEOUT(u64),
     HEARTBEAT,
 }

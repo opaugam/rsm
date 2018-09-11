@@ -42,7 +42,7 @@ if __name__ == "__main__":
     try:
 
         snippet = './target/release/node --id %d --host %s%s' % (args.id, '127.0.0.1:%d' % args.port, ' --seeds %s' % args.seeds if args.seeds else '')
-        pid = Popen(snippet.split(' '), stdin=PIPE, stdout=PIPE)
+        pid = Popen(snippet.split(' '), stdin=PIPE, stdout=PIPE, env={'RUST_BACKTRACE': 'full'})
         tid = Thread(target=_read, args=(pid,))
         tid.daemon = True
         tid.start()
