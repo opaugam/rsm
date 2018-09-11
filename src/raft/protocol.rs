@@ -237,8 +237,9 @@ impl Recv<Command, State> for FSM {
                     (FLWR(_), PREV(ref ctx)) => {
 
                         //
-                        // - force a immediate timeout to start the prevote cycle
+                        // - star the pre-voting cycle right away
                         //
+                        self.seq += 1;
                         pretty!(self, "{:?} pre-voting", ctx);
                         let _ = this.post(TIMEOUT(self.seq));
                     }
@@ -263,7 +264,6 @@ impl Recv<Command, State> for FSM {
                         //
                         // - we were just elected LEADER
                         // - reset the next/replication counters for each peer
-                        // - force a immediate timeout to send REPLICATE RPCs immediately
                         //
                         pretty!(self, "{:?} now leading", ctx);
                         for peer in &mut self.peers {
@@ -273,6 +273,10 @@ impl Recv<Command, State> for FSM {
                             }
                         }
 
+                        //
+                        // - replicate immediately
+                        //
+                        self.seq += 1;
                         let _ = this.post(TIMEOUT(self.seq));
 
                         for n in 0..32 {
@@ -567,6 +571,7 @@ impl Recv<Command, State> for FSM {
                                     let end = self.log.len() as u16;
                                     if msg.commit > self.commit {
                                         self.commit = cmp::min(msg.commit, end);
+                                        pretty!(self, "{:?} commit #{}", ctx, self.commit);
                                     }
 
                                     //
@@ -585,7 +590,6 @@ impl Recv<Command, State> for FSM {
                                     //
                                     let n = msg.append.len() as u16;
                                     let (off, term) = unpack!(msg.check);
-                                    pretty!(self, "check #{}/T{}", off, term);
                                     if off == 0 ||
                                         (off <= end && self.log[off as usize - 1].term == term)
                                     {
@@ -634,10 +638,11 @@ impl Recv<Command, State> for FSM {
                                         ctx.conflicts += 1;
                                         pretty!(
                                             self,
-                                            "{:?} conflict at #{}/T{} ({}/4)",
+                                            "{:?} conflict at #{}/T{}, asking for #{} ({}/4)",
                                             ctx,
                                             off,
                                             term,
+                                            off - rewind,
                                             ctx.conflicts
                                         );
                                         let msg = CONFLICT {
@@ -708,13 +713,6 @@ impl Recv<Command, State> for FSM {
                                     //
                                     let mut n = 1;
                                     let mut smallest = <u16>::max_value();
-                                    pretty!(
-                                        self,
-                                        "{:?} peer #{} offset acknowledged at #{}",
-                                        ctx,
-                                        msg.id,
-                                        msg.ack
-                                    );
                                     for peer in &mut self.peers {
                                         if *peer.0 != self.id {
 
@@ -722,6 +720,13 @@ impl Recv<Command, State> for FSM {
                                             // - first, update the acknowledged offset for that peer
                                             //
                                             if *peer.0 == msg.id {
+                                                pretty!(
+                                                    self,
+                                                    "{:?} peer #{} at offset #{}",
+                                                    ctx,
+                                                    peer.0,
+                                                    msg.ack
+                                                );
                                                 peer.1.ack = msg.ack;
                                             }
 
@@ -746,12 +751,7 @@ impl Recv<Command, State> for FSM {
                                     //
                                     if n > self.peers.len() >> 1 {
                                         self.commit = smallest;
-                                        pretty!(
-                                            self,
-                                            "{:?} quorum: commit offset now at #{}",
-                                            ctx,
-                                            smallest
-                                        );
+                                        pretty!(self, "{:?} commit #{}", ctx, smallest);
                                     }
                                 }
                                 _ => {}
@@ -780,6 +780,8 @@ impl Recv<Command, State> for FSM {
                                     // - the FOLLOWER is unable to match the check mark we
                                     //   specified during replication: update its write offset
                                     //   (usually decrementing it)
+                                    // - make sure to potentially reset the acknowledged offset
+                                    //   as well
                                     //
                                     let mut peer = self.peers.get_mut(&msg.id).unwrap();
                                     pretty!(
@@ -790,7 +792,14 @@ impl Recv<Command, State> for FSM {
                                         msg.try
                                     );
                                     assert!(msg.try < peer.off);
+                                    peer.ack = cmp::min(peer.ack, msg.try);
                                     peer.off = msg.try;
+
+                                    //
+                                    // - replicate immediately
+                                    //
+                                    self.seq += 1;
+                                    let _ = this.post(TIMEOUT(self.seq));
                                 }
                                 _ => {}
                             }
