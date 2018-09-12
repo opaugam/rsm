@@ -12,23 +12,38 @@
 //!                                <---------------+
 //! ```
 //!
-//!  # Capacity:
-//!  This implementation offers the following upper bounds:
+//!  # Todo
+//!      - snapshotting
+//!      - membership add()/remove()
+//!      - 'voted for' must be persisted (e.g persist an empty _NO_VOTE file under /tmp for a given
+//!        term and erase it as soon as we're not candidate anymore)
+//!
+//!  # Capacity
+//!
+//!   This implementation offers the following upper bounds:
 //!     - up to 64 peers
 //!     - up to 4000G terms
 //!     - log up to 65K entries
 //!
 //!  # Impementation notes
-//!  * In case of replication conflict the follower will ask the leader to rewind using a simple
-//!    exponential backoff potentially down to the first offset.
 //!
-//!  * The term is a 42 bits quantity while the offset is on 16 bits (65K entries max). The last
-//!    and previous offset/term comparisons to maintain the log up-do-date are done by using a
-//!    single u64 packed as | term | offset |.
+//!   * In case of replication conflict the follower will ask the leader to rewind using a simple
+//!     exponential backoff potentially down to the first offset.
 //!
-//! references:
-//! * [Original paper.](https://raft.github.io/raft.pdf)
-//! * [Optimizations.](http://openlife.cc/system/files/3-modifications-for-Raft-consensus.pdf)
+//!   * The term is a 42 bits quantity while the offset is on 16 bits (65K entries max). The last
+//!     and previous offset/term comparisons to maintain the log up-do-date are done by using a
+//!     single u64 packed as | term | offset |.
+//!
+//!  # Ideas
+//!
+//!    - force a 'commit-all' for cluster membership entries, e.g delay the commit offset index
+//!      increment as long as *all* the peers are not replicated with at least that entry (and
+//!      then atomically update the conf. on all peers at once).
+//!
+//!  # References
+//!
+//!   * [Original paper.](https://raft.github.io/raft.pdf)
+//!   * [Optimizations.](http://openlife.cc/system/files/3-modifications-for-Raft-consensus.pdf)
 use fsm::automaton::{Automaton, Opcode, Recv};
 use fsm::mpsc::MPSC;
 use fsm::timer::Timer;
@@ -43,44 +58,6 @@ use std::collections::HashMap;
 use std::fmt;
 use std::sync::Arc;
 use std::time::Duration;
-
-/// Events emitted by the state machine. Those are available for the user to react
-/// to membership changes, commits, etc.
-#[derive(Debug)]
-pub enum Notification {
-    FOLLOWING,
-    LEADING,
-    COMMIT(String),
-    EXIT,
-}
-
-/// Simple blocking notification sink consuming from a MPSC. Once signaled with no
-/// content the sink will disable itself and always fail.
-pub struct Sink {
-    sem: Semaphore,
-    fifo: MPSC<Notification>,
-}
-
-impl Sink {
-    #[allow(dead_code)]
-    pub fn next(&self) -> Option<Notification> {
-
-        //
-        // - wait/pop, this will fast-fail on None as soon as we disable the semaphore, e.g
-        //   when the state-machine exits
-        //
-        self.sem.wait();
-        self.fifo.pop().ok()
-    }
-
-    fn new() -> Self {
-
-        Sink {
-            sem: Semaphore::new(),
-            fifo: MPSC::new(),
-        }
-    }
-}
 
 /// Volatile information maintained while on a given state, typically who we voted
 /// for, who the leader is, etc.
@@ -167,8 +144,9 @@ impl Default for State {
 use self::Command::*;
 use self::State::*;
 
+/// Wrapper around the automaton. Public operations are exposed via a few methods.
 pub struct Protocol {
-    pub fsm: Arc<Automaton<Command>>,
+    fsm: Arc<Automaton<Command>>,
 }
 
 struct Peer {
@@ -177,10 +155,9 @@ struct Peer {
     ack: u16,
 }
 
-//@note voted for should be persisted
-struct FSM<F>
+struct FSM<T>
 where
-    F: 'static + Send + Fn(String) -> (),
+    T: 'static + Send + Fn(String) -> (),
 {
     /// Local peer index in [0, 64]
     id: u8,
@@ -197,7 +174,7 @@ where
     timer: Timer<Command>,
     log: Vec<LogEntry>,
     sink: Arc<Sink>,
-    write: F,
+    write: T,
     logger: Logger,
 }
 
@@ -222,9 +199,9 @@ macro_rules! unpack {
     };
 }
 
-impl<F> FSM<F>
+impl<T> FSM<T>
 where
-    F: 'static + Send + Fn(String) -> (),
+    T: 'static + Send + Fn(String) -> (),
 {
     const LIVENESS_TIMEOUT: u64 = 3000;
     const ELECTION_TIMEOUT: u64 = 250;
@@ -248,9 +225,9 @@ where
     }
 }
 
-impl<F> Recv<Command, State> for FSM<F>
+impl<T> Recv<Command, State> for FSM<T>
 where
-    F: Send + Fn(String) -> (),
+    T: Send + Fn(String) -> (),
 {
     fn recv(
         &mut self,
@@ -264,7 +241,7 @@ where
                 //
                 // - fake a cluster setup with 3 nodes on localhost
                 //
-                for n in 0..5 {
+                for n in 0..2 {
                     self.peers.insert(
                         n,
                         Peer {
@@ -282,7 +259,7 @@ where
                 self.timer.schedule(
                     this.clone(),
                     TIMEOUT(self.seq),
-                    Duration::from_millis(FSM::<F>::LIVENESS_TIMEOUT),
+                    Duration::from_millis(FSM::<T>::LIVENESS_TIMEOUT),
                 );
             }
             Opcode::TRANSITION(prv) => {
@@ -338,21 +315,10 @@ where
                         let _ = this.post(TIMEOUT(self.seq));
                         self.sink.fifo.push(Notification::LEADING);
                         self.sink.sem.signal();
-
-                        for n in 0..32 {
-                            let _ = this.post(STORE(format!("blob #{}", n)));
-                        }
                     }
                     (PREV(_), FLWR(ctx)) |
                     (CNDT(_), FLWR(ctx)) |
                     (LEAD(_), FLWR(ctx)) => {
-
-                        //
-                        // - notify the sink with FOLLOWING
-                        // - increment the sink semaphore
-                        //
-                        self.sink.fifo.push(Notification::FOLLOWING);
-                        self.sink.sem.signal();
 
                         //
                         // - we got a REPLICATE with a higher term
@@ -362,7 +328,7 @@ where
                         self.timer.schedule(
                             this.clone(),
                             TIMEOUT(self.seq),
-                            Duration::from_millis(FSM::<F>::LIVENESS_TIMEOUT),
+                            Duration::from_millis(FSM::<T>::LIVENESS_TIMEOUT),
                         );
                     }
                     _ => {
@@ -402,7 +368,7 @@ where
                         self.timer.schedule(
                             this.clone(),
                             TIMEOUT(self.seq),
-                            Duration::from_millis(FSM::<F>::ELECTION_TIMEOUT),
+                            Duration::from_millis(FSM::<T>::ELECTION_TIMEOUT),
                         );
                     }
                     CNDT(ref mut ctx) => {
@@ -443,7 +409,7 @@ where
                         self.timer.schedule(
                             this.clone(),
                             TIMEOUT(self.seq),
-                            Duration::from_millis(FSM::<F>::ELECTION_TIMEOUT),
+                            Duration::from_millis(FSM::<T>::ELECTION_TIMEOUT),
                         );
 
                     }
@@ -459,7 +425,7 @@ where
                             self.timer.schedule(
                                 this.clone(),
                                 TIMEOUT(self.seq),
-                                Duration::from_millis(FSM::<F>::LIVENESS_TIMEOUT),
+                                Duration::from_millis(FSM::<T>::LIVENESS_TIMEOUT),
                             );
 
                         } else {
@@ -467,8 +433,12 @@ where
                             //
                             // - liveness timeout: the leader may be down or we are
                             //   not reachable anymore (network partition)
+                            // - notify the sink with IDLE
+                            // - increment the sink semaphore
                             // - switch to PREVOTE to initiate a new election cycle
                             //
+                            self.sink.fifo.push(Notification::IDLE);
+                            self.sink.sem.signal();
                             return PREV(Default::default());
                         }
                     }
@@ -551,7 +521,7 @@ where
                         self.timer.schedule(
                             this.clone(),
                             TIMEOUT(self.seq),
-                            Duration::from_millis(FSM::<F>::LIVENESS_TIMEOUT / 3),
+                            Duration::from_millis(FSM::<T>::LIVENESS_TIMEOUT / 3),
                         );
                     }
                 }
@@ -559,18 +529,83 @@ where
             Opcode::INPUT(STORE(blob)) => {
                 match state {
                     LEAD(ref ctx) => {
-                        pretty!(self, "{:?} log <- '{}'", ctx, blob);
+                        
+                        //
+                        // - add the entry to our log
+                        //
+                        pretty!(self, "{:?} log <- '{}' <- local", ctx, blob);
                         self.log.push(LogEntry {
                             term: self.term,
                             blob,
                         });
                         self.tail = pack!(self.log.len() as u16, self.term);
+
+                        //
+                        // - replicate immediately
+                        //
+                        self.seq += 1;
+                        let _ = this.post(TIMEOUT(self.seq));
+                    }
+                    FLWR(ref ctx) => {
+                        if let Some(id) = ctx.leader {
+
+                            //
+                            // - if we have a leader redirect the user payload to that peer via
+                            //   a APPEND
+                            //
+                            let peer = &self.peers[&id];
+                            let msg = APPEND {
+                                id: self.id,
+                                term: self.term,
+                                blob,
+                            };
+
+                            (self.write)(format!("{}", msg.to_raw(&self.host, &peer.host)));
+                        }
                     }
                     _ => {}
                 }
             }
             Opcode::INPUT(MESSAGE(raw)) => {
                 match raw.code {
+                    APPEND::CODE => {
+                        let mut msg: APPEND = serde_json::from_value(raw.user).unwrap();
+                        debug_assert!(msg.id != self.id);
+                        if msg.term < self.term {
+
+                            //
+                            // - stale peer: send back a UPGRADE
+                            //
+                            let msg = UPGRADE {
+                                id: self.id,
+                                term: self.term,
+                            };
+                            (self.write)(format!("{}", msg.to_raw(&self.host, &raw.src)));
+
+                        } else {
+                            match state {
+                                LEAD(ref ctx) => {
+
+                                    //
+                                    // - add the entry to our log
+                                    //
+                                    pretty!(self, "{:?} log <- '{}' <- peer #{}", ctx, msg.blob, msg.id);
+                                    self.log.push(LogEntry {
+                                        term: self.term,
+                                        blob: msg.blob,
+                                    });
+                                    self.tail = pack!(self.log.len() as u16, self.term);
+
+                                    //
+                                    // - replicate immediately
+                                    //
+                                    self.seq += 1;
+                                    let _ = this.post(TIMEOUT(self.seq));
+                                }
+                                _ => {}
+                            }
+                        }
+                    }
                     UPGRADE::CODE => {
                         let msg: UPGRADE = serde_json::from_value(raw.user).unwrap();
                         debug_assert!(msg.id != self.id);
@@ -579,9 +614,13 @@ where
                             //
                             // - we are stale
                             // - upgrade our term
-                            // - always transition to FOLLOWER
+                            // - notify the sink with IDLE
+                            // - increment the sink semaphore
+                            // - always transition to FOLLOWER without a leader (yet)
                             //
                             self.term = msg.term;
+                            self.sink.fifo.push(Notification::IDLE);
+                            self.sink.sem.signal();
                             return FLWR(context::FLWR {
                                 live: false,
                                 conflicts: 0,
@@ -610,9 +649,13 @@ where
                                     //
                                     // - a LEADER is active
                                     // - upgrade our term if we are stale
+                                    // - notify the sink with FOLLOWING
+                                    // - increment the sink semaphore
                                     // - transition to FOLLOWER
                                     //
                                     self.term = msg.term;
+                                    self.sink.fifo.push(Notification::FOLLOWING);
+                                    self.sink.sem.signal();
                                     return FLWR(context::FLWR {
                                         live: true,
                                         conflicts: 0,
@@ -620,6 +663,16 @@ where
                                     });
                                 }
                                 FLWR(ref mut ctx) => {
+                                    if ctx.leader.is_none() {
+
+                                        //
+                                        // - notify the sink with FOLLOWING in case we went
+                                        //   from no leader to one (e.g we started for instance)
+                                        // - increment the sink semaphore
+                                        //
+                                        self.sink.fifo.push(Notification::FOLLOWING);
+                                        self.sink.sem.signal();
+                                    }
 
                                     //
                                     // - upgrade our term if we are stale
@@ -689,11 +742,13 @@ where
                                             //
                                             self.log.truncate(off as usize);
                                             self.log.append(&mut msg.append);
-                                            pretty!(self, "{:?} #{} now replicated", ctx, end + n);
+                                            let ack = self.log.len() as u16;
+                                            self.tail = pack!(ack, self.term);
+                                            pretty!(self, "{:?} #{} now replicated", ctx, ack);
                                             let msg = CONFIRM {
                                                 id: self.id,
                                                 term: self.term,
-                                                ack: self.log.len() as u16,
+                                                ack,
                                             };
 
                                             (self.write)(
@@ -737,7 +792,9 @@ where
                                 LEAD(ref ctx) => {
 
                                     //
-                                    // - another LEADER was elected
+                                    // - another peer was elected LEADER
+                                    // - notify the sink with FOLLOWING
+                                    // - increment the sink semaphore
                                     // - upgrade our term and transition to FOLLOWER
                                     // - note that usualy msg.term is > to our term except in the
                                     //   case where quorum is 2 (e.g it is possible 2 out of 3
@@ -747,8 +804,12 @@ where
                                     //   revert to FOLLOWER
                                     //
                                     self.term = msg.term;
-                                    debug_assert!(msg.term > self.term || self.peers.len() >> 1 == 1);
+                                    debug_assert!(
+                                        msg.term > self.term || self.peers.len() >> 1 == 1
+                                    );
                                     pretty!(self, "{:?} stepping down", ctx);
+                                    self.sink.fifo.push(Notification::FOLLOWING);
+                                    self.sink.sem.signal();
                                     return FLWR(context::FLWR {
                                         live: true,
                                         conflicts: 0,
@@ -828,7 +889,7 @@ where
                                     // - do we have quorum ?
                                     //
                                     if n > self.peers.len() >> 1 {
-                                        pretty!(self, "{:?} commit #{}", ctx, smallest);
+                                        pretty!(self, "{:?} commit now at #{}", ctx, smallest);
 
                                         //
                                         // - notify the sink with a COMMIT for each entry
@@ -1070,15 +1131,15 @@ where
 }
 
 impl Protocol {
-    pub fn spawn<F>(
+    pub fn spawn<T>(
         guard: Arc<Guard>,
         id: u8,
         host: String,
-        write: F,
+        write: T,
         logger: Logger,
     ) -> (Self, Arc<Sink>)
     where
-        F: 'static + Send + Fn(String) -> (),
+        T: 'static + Send + Fn(String) -> (),
     {
 
         let sink = Arc::new(Sink::new());
@@ -1102,10 +1163,70 @@ impl Protocol {
 
         (Protocol { fsm }, sink)
     }
+
+    #[allow(dead_code)]
+    pub fn drain(&self) -> () {
+        self.fsm.drain();
+    }
+
+    #[allow(dead_code)]
+    pub fn read(&self, raw: RAW) -> () {
+        let _ = self.fsm.post(MESSAGE(raw));
+    }
+
+    #[allow(dead_code)]
+    pub fn store(&self, blob: String) -> () {
+        let _ = self.fsm.post(STORE(blob));
+    }
+}
+
+impl Clone for Protocol {
+    fn clone(&self) -> Self {
+        Protocol { fsm: self.fsm.clone() }
+    }
 }
 
 impl Drop for Protocol {
     fn drop(&mut self) -> () {
         self.fsm.drain();
+    }
+}
+
+/// Events emitted by the state machine. Those are available for the user to react
+/// to membership changes, commits, etc.
+#[derive(Debug)]
+pub enum Notification {
+    FOLLOWING,
+    LEADING,
+    IDLE,
+    COMMIT(String),
+    EXIT,
+}
+
+/// Simple blocking notification sink consuming from a MPSC. Once signaled with no
+/// content the sink will disable itself and always fail.
+pub struct Sink {
+    sem: Semaphore,
+    fifo: MPSC<Notification>,
+}
+
+impl Sink {
+    #[allow(dead_code)]
+    pub fn next(&self) -> Option<Notification> {
+
+        //
+        // - wait/pop, this will fast-fail on None as soon as we disable the semaphore, e.g
+        //   when the state-machine exits
+        //
+        self.sem.wait();
+        self.fifo.pop().ok()
+    }
+
+    fn new() -> Self {
+
+        Sink {
+            sem: Semaphore::new(),
+            fifo: MPSC::new(),
+        }
     }
 }

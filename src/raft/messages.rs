@@ -90,6 +90,13 @@ pub struct VOTE {
     pub term: u64,
 }
 
+#[derive(Debug, Serialize, Deserialize)]
+pub struct APPEND {
+    pub id: u8,
+    pub term: u64,
+    pub blob: String,
+}
+
 declare!(1, REPLICATE);
 declare!(2, CONFIRM);
 declare!(3, CONFLICT);
@@ -97,6 +104,7 @@ declare!(4, UPGRADE);
 declare!(5, CHECK);
 declare!(6, ADVERTISE);
 declare!(7, VOTE);
+declare!(8, APPEND);
 
 pub enum Command {
     MESSAGE(RAW),

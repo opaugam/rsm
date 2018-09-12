@@ -12,7 +12,6 @@ extern crate slog_term;
 
 use rsm::primitives::event::*;
 use rsm::raft::messages::RAW;
-use rsm::raft::messages::Command::MESSAGE;
 use rsm::raft::protocol::{Notification, Protocol};
 use slog::{Drain, Level, LevelFilter, Logger};
 use slog_term::{FullFormat, PlainSyncDecorator};
@@ -68,7 +67,7 @@ fn main() {
     //
     let id = value_t!(args, "ID", u8).unwrap();
     let host = value_t!(args, "HOST", String).unwrap();
-    let (protocol, sink) = Protocol::spawn(
+    let (raft, sink) = Protocol::spawn(
         guard.clone(),
         id,
         host,
@@ -82,7 +81,7 @@ fn main() {
         // - read STDIN on a dedicated thread (required to be able to gracefully
         //   synchronize and wait for all automata to drain)
         //
-        let fsm = protocol.fsm.clone();
+        let raft = raft.clone();
         let _ = thread::spawn(move || {
             let stdin = stdin();
             for line in stdin.lock().lines() {
@@ -95,13 +94,16 @@ fn main() {
                             // - forward to the state machine
                             //
                             let raw: RAW = serde_json::from_str(&line).unwrap();
-                            let _ = fsm.post(MESSAGE(raw));
+                            raft.read(raw);
                         }
                     }
                     _ => {}
                 }
             }
         });
+    }
+    {
+
     }
 
     //
@@ -110,14 +112,29 @@ fn main() {
     // - start consuming from the sink
     // - as soon as next() fails on a None we can move on and wait for termination
     //
-    ctrlc::set_handler(move || { protocol.fsm.drain(); }).unwrap();
+    {
+        let raft = raft.clone();
+        ctrlc::set_handler(move || { raft.drain(); }).unwrap();
+    }
     loop {
         match sink.next() {
-            None => break,
+            None => break,            
             Some(Notification::COMMIT(blob)) => {
                 info!(&log, "data -> <{}>", blob);
             }
-            _ => {}
+            Some(notif) => {
+                info!(&log, "notif: {:?}", notif);
+                match notif {
+                    Notification::FOLLOWING => {
+
+                        //
+                        // -
+                        //
+                        raft.store(format!("hello i am peer #{} !", id));
+                    }
+                    _ => {}
+                }
+            }
         }
     }
 
