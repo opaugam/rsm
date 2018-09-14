@@ -4,6 +4,7 @@ version = "0.1.0"
 authors = ["Olivier Paugam <opaugam@gmail.com>"]
 
 [dependencies]
+bincode      = "1.0"
 clap         = "2.32"
 ctrlc        = { version = "3.0", features = ["termination"] }
 rand         = "0.5"
@@ -26,5 +27,5 @@ name = "rsm"
 path = "src/lib.rs"
 
 [[bin]]
-name = "node"
-path = "src/bin/node.rs"
+name = "cluster"
+path = "src/bin/cluster.rs"

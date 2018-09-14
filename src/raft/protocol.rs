@@ -54,6 +54,7 @@
 //!
 //!   * [Original paper.](https://raft.github.io/raft.pdf)
 //!   * [Optimizations.](http://openlife.cc/system/files/3-modifications-for-Raft-consensus.pdf)
+use bincode::{serialize, deserialize};
 use fsm::automaton::{Automaton, Opcode, Recv};
 use fsm::mpsc::MPSC;
 use fsm::timer::Timer;
@@ -61,13 +62,41 @@ use primitives::event::*;
 use primitives::semaphore::*;
 use raft::messages::*;
 use rand::{Rng, thread_rng};
-use serde_json;
+use self::Command::*;
+use self::State::*;
 use slog::Logger;
 use std::cmp;
 use std::collections::HashMap;
 use std::fmt;
 use std::sync::Arc;
 use std::time::Duration;
+
+macro_rules! pretty {
+    ($self:ident, $fmt:expr $(, $arg:expr)*) => {
+        debug!(&$self.logger, $fmt, $($arg),* ;
+            "term" => $self.term,
+            "head" => $self.head,
+            "tail" => $self.tail,
+            "commit" => $self.commit);
+    };
+}
+
+macro_rules! declare {
+    ($code:expr, $msg:ident) => {
+        impl $msg {
+            pub const CODE: u8 = $code;
+            pub fn to_raw(&self, src: &str, dst: &str) -> Vec<u8> {
+                let raw = RAW {
+                    code: $msg::CODE,
+                    src: src.into(),
+                    dst: dst.into(),
+                    msg: serialize(&self).unwrap(),
+                };
+                serialize(&raw).unwrap()
+            }
+        }
+    };
+}
 
 /// Volatile information maintained while on a given state, typically who we voted
 /// for, who the leader is, etc.
@@ -112,6 +141,13 @@ mod context {
     }
 }
 
+pub enum Command {
+    INCOMING(RAW),
+    STORE(String),
+    TIMEOUT(u64),
+    HEARTBEAT,
+}
+
 #[derive(Copy, Clone)]
 enum State {
     PREV(context::CNDT),
@@ -150,9 +186,6 @@ impl Default for State {
     }
 }
 
-use self::Command::*;
-use self::State::*;
-
 /// Wrapper around the automaton. Public operations are exposed via a few methods.
 pub struct Protocol {
     fsm: Arc<Automaton<Command>>,
@@ -168,7 +201,6 @@ struct Peer {
     ack: u64,
 }
 
-
 ///  todo items:
 ///    o) snapshotting
 ///    o) membership add()/remove()
@@ -176,7 +208,7 @@ struct Peer {
 ///       given term and erase it as soon as we're not candidate anymore ?)
 struct FSM<T>
 where
-    T: 'static + Send + Fn(String) -> (),
+    T: 'static + Send + Fn(&String, Vec<u8>) -> (),
 {
     /// Local peer index in [0, 64].
     id: u8,
@@ -194,6 +226,7 @@ where
     age: u64,
     /// Current commit offset, as reported by a quorum, starts at #1.
     commit: u64,
+    /// Map of peer id <-> host + offsets
     peers: HashMap<u8, Peer>,
     timer: Timer<Command>,
     log: Vec<LogEntry>,
@@ -202,25 +235,26 @@ where
     logger: Logger,
 }
 
-macro_rules! pretty {
-    ($self:ident, $fmt:expr $(, $arg:expr)*) => {
-        debug!(&$self.logger, $fmt, $($arg),* ;
-            "term" => $self.term,
-            "head" => $self.head,
-            "tail" => $self.tail,
-            "commit" => $self.commit);
-    };
-}
+declare!(0, PING);
+declare!(1, REPLICATE);
+declare!(2, ACK);
+declare!(3, REBASE);
+declare!(4, UPGRADE);
+declare!(5, PROBE);
+declare!(6, AVAILABLE);
+declare!(7, ADVERTISE);
+declare!(8, VOTE);
+declare!(9, APPEND);
 
 impl<T> FSM<T>
 where
-    T: 'static + Send + Fn(String) -> (),
+    T: 'static + Send + Fn(&String, Vec<u8>) -> (),
 {
     const LIVENESS_TIMEOUT: u64 = 3000;
     const ELECTION_TIMEOUT: u64 = 250;
     const DISKIO_THRESHOLD: u64 = 9;
 
-    fn add_vote(&self, votes: &mut u64, id: u8) -> bool {
+    fn count_votes(&self, votes: &mut u64, id: u8) -> (u8, bool) {
 
         //
         // - the votes byte is used as a bitmask (1 bit per peer)
@@ -228,20 +262,20 @@ where
         // - count the set bits
         // - compare with the quorum
         //
-        let mut total = 1;
+        let mut total = 0;
         *votes |= 1 << id;
         let mut n = *votes;
         while n > 0 {
             n &= n - 1;
             total += 1;
         }
-        total > self.peers.len() as u8 >> 1
+        (total + 1, total > (1 + self.peers.len() as u8) >> 1)
     }
 }
 
 impl<T> Recv<Command, State> for FSM<T>
 where
-    T: Send + Fn(String) -> (),
+    T: Send + Fn(&String, Vec<u8>) -> (),
 {
     fn recv(
         &mut self,
@@ -251,20 +285,7 @@ where
     ) -> State {
         match opcode {
             Opcode::START => {
-
-                //
-                // - fake a cluster setup with 3 nodes on localhost
-                //
-                for n in 0..3 {
-                    self.peers.insert(
-                        n,
-                        Peer {
-                            host: format!("127.0.0.1:900{}", n),
-                            off: 1,
-                            ack: 1,
-                        },
-                    );
-                }
+                pretty!(self, "starting ({} peers)", self.peers.len());
 
                 //
                 // - by definition offset #1 is some empty marker
@@ -327,10 +348,9 @@ where
                         //
                         pretty!(self, "{:?} now leading", ctx);
                         for peer in &mut self.peers {
-                            if *peer.0 != self.id {
-                                peer.1.off = self.head;
-                                peer.1.ack = 1;
-                            }
+                            debug_assert!(*peer.0 != self.id);
+                            peer.1.off = self.head;
+                            peer.1.ack = 1;
                         }
 
                         //
@@ -377,16 +397,17 @@ where
                         //
                         ctx.pick = None;
                         for peer in &self.peers {
-                            if *peer.0 != self.id {
-
-                                let msg = PROBE {
-                                    id: self.id,
-                                    term: self.term + 1,
-                                    head: self.head,
-                                    age: self.age,
-                                };
-                                (self.write)(format!("{}", msg.to_raw(&self.host, &peer.1.host)));
-                            }
+                            debug_assert!(*peer.0 != self.id);
+                            let msg = PROBE {
+                                id: self.id,
+                                term: self.term + 1,
+                                head: self.head,
+                                age: self.age,
+                            };
+                            (self.write)(
+                                &peer.1.host.clone(),
+                                msg.to_raw(&self.host, &peer.1.host),
+                            );
                         }
 
                         //
@@ -419,16 +440,14 @@ where
                         //
                         self.term += 1;
                         for peer in &self.peers {
-                            if *peer.0 != self.id {
-
-                                let msg = ADVERTISE {
-                                    id: self.id,
-                                    term: self.term,
-                                    head: self.head,
-                                    age: self.age,
-                                };
-                                (self.write)(format!("{}", msg.to_raw(&self.host, &peer.1.host)));
-                            }
+                            debug_assert!(*peer.0 != self.id);
+                            let msg = ADVERTISE {
+                                id: self.id,
+                                term: self.term,
+                                head: self.head,
+                                age: self.age,
+                            };
+                            (self.write)(&peer.1.host, msg.to_raw(&self.host, &peer.1.host));
                         }
 
                         //
@@ -481,104 +500,98 @@ where
                         // @todo better manager idle times vs. dirty state
                         //
                         for peer in &mut self.peers {
-                            if *peer.0 != self.id {
+                            debug_assert!(*peer.0 != self.id);
+                            let msg = PING {
+                                id: self.id,
+                                term: self.term,
+                                commit: self.commit,
+                            };
+                            (self.write)(&peer.1.host, msg.to_raw(&self.host, &peer.1.host));
+                            debug_assert!(peer.1.off <= self.head);
+                            if self.head > peer.1.off {
 
-                                let msg = PING {
+                                //
+                                // - we have entries to replicate
+                                // - prep a append buffer
+                                // - check if we need to replicate
+                                //
+                                let mut append = Vec::new();
+                                debug_assert!(self.head >= peer.1.ack);
+                                debug_assert!(self.head >= peer.1.off);
+                                debug_assert!(peer.1.off >= peer.1.ack);
+                                let rebase = if peer.1.off < self.tail {
+
+                                    //
+                                    // - if the peer is behind our log window bump it
+                                    // - the rebase flag will force it to align with us
+                                    // - copy the whole log window to the append buffer
+                                    // - please note 1+ commit notifications will thus be lost
+                                    //   on that peer (at least the peer will notify it was
+                                    //   rebased)
+                                    //
+                                    pretty!(
+                                        self,
+                                        "{:?} bumping peer #{} to offset #{} (lag ?)",
+                                        ctx,
+                                        peer.0,
+                                        self.tail
+                                    );
+                                    peer.1.off = self.tail;
+                                    let size = self.head - self.tail + 1;
+                                    for n in 0..size {
+                                        append.push(self.log[n as usize].clone());
+                                    }
+                                    true
+
+                                } else {
+
+                                    //
+                                    // - we have 1+ log entries to replicate
+                                    // - copy entries from [off + 1, head] to the append buffer
+                                    //
+                                    let size = self.head - peer.1.off;
+                                    pretty!(
+                                        self,
+                                        "{:?} replicating [#{} .. #{}] to peer #{}",
+                                        ctx,
+                                        peer.1.off + 1,
+                                        self.head,
+                                        peer.0
+                                    );
+                                    for n in 0..size {
+                                        append.push(
+                                            self.log[(peer.1.off + 1 - self.tail + n) as usize]
+                                                .clone(),
+                                        );
+                                    }
+                                    false
+                                };
+
+                                //
+                                // - specify the index+term for the write offset (e.g the offset
+                                //   immediately preceding the first replicated entry)
+                                // - even if we have no entries to replicate this will force the
+                                //   FOLLOWER to check its log and flag any conflict
+                                // - blank peers will also be able to synch-up this way
+                                // - emit a REPLICATE
+                                //
+                                debug_assert!(append.len() > 0);
+                                let msg = REPLICATE {
                                     id: self.id,
                                     term: self.term,
                                     commit: self.commit,
+                                    off: peer.1.off,
+                                    age: self.log[(peer.1.off - self.tail) as usize].term,
+                                    append: Vec::new(), //append,
+                                    rebase,
                                 };
 
-                                (self.write)(format!("{}", msg.to_raw(&self.host, &peer.1.host)));
-                                debug_assert!(peer.1.off <= self.head);
-                                if self.head > peer.1.off {
+                                (self.write)(&peer.1.host, msg.to_raw(&self.host, &peer.1.host));
 
-                                    //
-                                    // - we have entries to replicate
-                                    // - prep a append buffer
-                                    // - check if we need to replicate
-                                    //
-                                    let mut append = Vec::new();
-                                    debug_assert!(self.head >= peer.1.ack);
-                                    debug_assert!(self.head >= peer.1.off);
-                                    debug_assert!(peer.1.off >= peer.1.ack);
-                                    let rebase = if peer.1.off < self.tail {
-
-                                        //
-                                        // - if the peer is behind our log window bump it
-                                        // - the rebase flag will force it to align with us
-                                        // - copy the whole log window to the append buffer
-                                        // - please note 1+ commit notifications will thus be lost
-                                        //   on that peer (at least the peer will notify it was
-                                        //   rebased)
-                                        //
-                                        pretty!(
-                                            self,
-                                            "{:?} bumping peer #{} to offset #{} (lag ?)",
-                                            ctx,
-                                            peer.0,
-                                            self.tail
-                                        );
-                                        peer.1.off = self.tail;
-                                        let size = self.head - self.tail + 1;
-                                        for n in 0..size {
-                                            append.push(self.log[n as usize].clone());
-                                        }
-                                        true
-
-                                    } else {
-
-                                        //
-                                        // - we have 1+ log entries to replicate
-                                        // - copy entries from [off + 1, head] to the append buffer
-                                        //
-                                        let size = self.head - peer.1.off;
-                                        pretty!(
-                                            self,
-                                            "{:?} replicating [#{} .. #{}] to peer #{}",
-                                            ctx,
-                                            peer.1.off + 1,
-                                            self.head,
-                                            peer.0
-                                        );
-                                        for n in 0..size {
-                                            append.push(
-                                                self.log[(peer.1.off + 1 - self.tail + n) as
-                                                             usize]
-                                                    .clone(),
-                                            );
-                                        }
-                                        false
-                                    };
-
-                                    //
-                                    // - specify the index+term for the write offset (e.g the offset
-                                    //   immediately preceding the first replicated entry)
-                                    // - even if we have no entries to replicate this will force the
-                                    //   FOLLOWER to check its log and flag any conflict
-                                    // - blank peers will also be able to synch-up this way
-                                    // - emit a REPLICATE
-                                    //
-                                    debug_assert!(append.len() > 0);
-                                    let msg = REPLICATE {
-                                        id: self.id,
-                                        term: self.term,
-                                        commit: self.commit,
-                                        off: peer.1.off,
-                                        age: self.log[(peer.1.off - self.tail) as usize].term,
-                                        append,
-                                        rebase,
-                                    };
-
-                                    (self.write)(
-                                        format!("{}", msg.to_raw(&self.host, &peer.1.host)),
-                                    );
-
-                                    //
-                                    // - update the offset for that peer
-                                    //
-                                    peer.1.off = self.head;
-                                }
+                                //
+                                // - update the offset for that peer
+                                //
+                                peer.1.off = self.head;
                             }
                         }
 
@@ -630,16 +643,17 @@ where
                                 blob,
                             };
 
-                            (self.write)(format!("{}", msg.to_raw(&self.host, &peer.host)));
+                            (self.write)(&peer.host, msg.to_raw(&self.host, &peer.host));
                         }
                     }
                     _ => {}
                 }
             }
-            Opcode::INPUT(MESSAGE(raw)) => {
+            Opcode::INPUT(INCOMING(raw)) => {
+                trace!(&self.logger, "<- {}B from {} (code #{})", raw.msg.len(), raw.src, raw.code);
                 match raw.code {
                     APPEND::CODE => {
-                        let mut msg: APPEND = serde_json::from_value(raw.user).unwrap();
+                        let mut msg: APPEND = deserialize(&raw.msg[..]).unwrap();
                         debug_assert!(msg.id != self.id);
                         if msg.term < self.term {
 
@@ -650,7 +664,7 @@ where
                                 id: self.id,
                                 term: self.term,
                             };
-                            (self.write)(format!("{}", msg.to_raw(&self.host, &raw.src)));
+                            (self.write)(&raw.src, msg.to_raw(&self.host, &raw.src));
 
                         } else {
                             match state {
@@ -680,7 +694,7 @@ where
                         }
                     }
                     UPGRADE::CODE => {
-                        let msg: UPGRADE = serde_json::from_value(raw.user).unwrap();
+                        let msg: UPGRADE = deserialize(&raw.msg[..]).unwrap();
                         debug_assert!(msg.id != self.id);
                         if msg.term > self.term {
 
@@ -704,7 +718,7 @@ where
                         }
                     }
                     PING::CODE => {
-                        let mut msg: PING = serde_json::from_value(raw.user).unwrap();
+                        let mut msg: PING = deserialize(&raw.msg[..]).unwrap();
                         debug_assert!(msg.id != self.id);
                         if msg.term < self.term {
 
@@ -715,7 +729,7 @@ where
                                 id: self.id,
                                 term: self.term,
                             };
-                            (self.write)(format!("{}", msg.to_raw(&self.host, &raw.src)));
+                            (self.write)(&raw.src, msg.to_raw(&self.host, &raw.src));
 
                         } else {
                             match state {
@@ -820,7 +834,7 @@ where
                         }
                     }
                     REPLICATE::CODE => {
-                        let mut msg: REPLICATE = serde_json::from_value(raw.user).unwrap();
+                        let mut msg: REPLICATE = deserialize(&raw.msg[..]).unwrap();
                         debug_assert!(msg.id != self.id);
                         if msg.term < self.term {
 
@@ -831,7 +845,7 @@ where
                                 id: self.id,
                                 term: self.term,
                             };
-                            (self.write)(format!("{}", msg.to_raw(&self.host, &raw.src)));
+                            (self.write)(&raw.src, msg.to_raw(&self.host, &raw.src));
 
                         } else {
                             match state {
@@ -842,7 +856,7 @@ where
                                     // - override our tail and head offsets
                                     //
                                     self.log.clear();
-                                    self.log.append(&mut msg.append);
+                                    //self.log.append(&mut msg.append);
                                     self.tail = msg.off;
                                     self.age = self.log.last().unwrap().term;
                                     self.head = self.tail + self.log.len() as u64 - 1;
@@ -860,7 +874,7 @@ where
                                         ack: self.head,
                                     };
 
-                                    (self.write)(format!("{}", msg.to_raw(&self.host, &raw.src)));
+                                    (self.write)(&raw.src, msg.to_raw(&self.host, &raw.src));
                                 }
                                 FLWR(ref mut ctx) => {
 
@@ -908,7 +922,7 @@ where
                                         // - udpate our head offset
                                         //
                                         self.log.truncate(off + 1);
-                                        self.log.append(&mut msg.append);
+                                        //self.log.append(&mut msg.append);
                                         debug_assert!(self.log.len() > 0);
                                         self.age = self.log.last().unwrap().term;
                                         self.head = self.tail + self.log.len() as u64 - 1;
@@ -925,9 +939,7 @@ where
                                             ack: self.head,
                                         };
 
-                                        (self.write)(
-                                            format!("{}", msg.to_raw(&self.host, &raw.src)),
-                                        );
+                                        (self.write)(&raw.src, msg.to_raw(&self.host, &raw.src));
                                         pretty!(self, "{:?} #{} now replicated", ctx, self.head);
 
                                     } else {
@@ -954,9 +966,7 @@ where
                                             term: self.term,
                                         };
 
-                                        (self.write)(
-                                            format!("{}", msg.to_raw(&self.host, &raw.src)),
-                                        );
+                                        (self.write)(&raw.src, msg.to_raw(&self.host, &raw.src));
                                     }
                                 }
                                 _ => {}
@@ -964,7 +974,7 @@ where
                         }
                     }
                     ACK::CODE => {
-                        let msg: ACK = serde_json::from_value(raw.user).unwrap();
+                        let msg: ACK = deserialize(&raw.msg[..]).unwrap();
                         debug_assert!(msg.id != self.id);
                         if msg.term < self.term {
 
@@ -975,7 +985,7 @@ where
                                 id: self.id,
                                 term: self.term,
                             };
-                            (self.write)(format!("{}", msg.to_raw(&self.host, &raw.src)));
+                            (self.write)(&raw.src, msg.to_raw(&self.host, &raw.src));
 
                         } else {
                             match state {
@@ -1000,33 +1010,32 @@ where
                                     let mut smallest = <u64>::max_value();
                                     debug_assert!(msg.ack <= self.head);
                                     for peer in &mut self.peers {
-                                        if *peer.0 != self.id {
+                                        debug_assert!(*peer.0 != self.id);
 
-                                            //
-                                            // - first, update the acknowledged offset for that peer
-                                            //
-                                            if *peer.0 == msg.id {
-                                                pretty!(
-                                                    self,
-                                                    "{:?} peer #{} at offset #{}",
-                                                    ctx,
-                                                    peer.0,
-                                                    msg.ack
-                                                );
-                                                peer.1.ack = msg.ack;
-                                            }
+                                        //
+                                        // - first, update the acknowledged offset for that peer
+                                        //
+                                        if *peer.0 == msg.id {
+                                            pretty!(
+                                                self,
+                                                "{:?} peer #{} at offset #{}",
+                                                ctx,
+                                                peer.0,
+                                                msg.ack
+                                            );
+                                            peer.1.ack = msg.ack;
+                                        }
 
-                                            //
-                                            // - any peer whose confirmed replicated offset is > to
-                                            //   our commit is part of the quorum set
-                                            // - keep the smallest of those offsets
-                                            //
-                                            if peer.1.ack > self.commit {
-                                                if peer.1.ack < smallest {
-                                                    smallest = peer.1.ack;
-                                                }
-                                                n += 1;
+                                        //
+                                        // - any peer whose confirmed replicated offset is > to
+                                        //   our commit is part of the quorum set
+                                        // - keep the smallest of those offsets
+                                        //
+                                        if peer.1.ack > self.commit {
+                                            if peer.1.ack < smallest {
+                                                smallest = peer.1.ack;
                                             }
+                                            n += 1;
                                         }
                                     }
 
@@ -1077,7 +1086,7 @@ where
                         }
                     }
                     REBASE::CODE => {
-                        let msg: REBASE = serde_json::from_value(raw.user).unwrap();
+                        let msg: REBASE = deserialize(&raw.msg[..]).unwrap();
                         debug_assert!(msg.id != self.id);
                         if msg.term < self.term {
 
@@ -1088,7 +1097,7 @@ where
                                 id: self.id,
                                 term: self.term,
                             };
-                            (self.write)(format!("{}", msg.to_raw(&self.host, &raw.src)));
+                            (self.write)(&raw.src, msg.to_raw(&self.host, &raw.src));
 
                         } else {
                             match state {
@@ -1108,7 +1117,7 @@ where
                         }
                     }
                     PROBE::CODE => {
-                        let msg: PROBE = serde_json::from_value(raw.user).unwrap();
+                        let msg: PROBE = deserialize(&raw.msg[..]).unwrap();
                         debug_assert!(msg.id != self.id);
                         if msg.term < self.term {
 
@@ -1119,7 +1128,7 @@ where
                                 id: self.id,
                                 term: self.term,
                             };
-                            (self.write)(format!("{}", msg.to_raw(&self.host, &raw.src)));
+                            (self.write)(&raw.src, msg.to_raw(&self.host, &raw.src));
 
                         } else {
                             match state {
@@ -1133,21 +1142,19 @@ where
                                     if msg.age < self.age || msg.head < self.head {
                                     } else {
 
-                                        let msg = VOTE {
+                                        let msg = AVAILABLE {
                                             id: self.id,
                                             term: self.term,
                                         };
-                                        (self.write)(
-                                            format!("{}", msg.to_raw(&self.host, &raw.src)),
-                                        );
+                                        (self.write)(&raw.src, msg.to_raw(&self.host, &raw.src));
                                     }
                                 }
                                 _ => {}
                             }
                         }
                     }
-                    ADVERTISE::CODE => {
-                        let msg: ADVERTISE = serde_json::from_value(raw.user).unwrap();
+                    AVAILABLE::CODE => {
+                        let msg: AVAILABLE = deserialize(&raw.msg[..]).unwrap();
                         debug_assert!(msg.id != self.id);
                         if msg.term < self.term {
 
@@ -1158,7 +1165,49 @@ where
                                 id: self.id,
                                 term: self.term,
                             };
-                            (self.write)(format!("{}", msg.to_raw(&self.host, &raw.src)));
+                            (self.write)(&raw.src, msg.to_raw(&self.host, &raw.src));
+                        } else {
+                            match state {
+                                PREV(ref mut ctx) => {
+
+                                    //
+                                    // - we are in the pre-voting phase
+                                    // - this vote does not count, we are just using it to
+                                    //   check if we can reach quorum or not
+                                    // - this is like testing for reachability
+                                    // - if we get quorum transition to CANDIDATE to trigger the
+                                    //   real election (and reset the votes bit array)
+                                    //
+                                    let (n, granted) = self.count_votes(&mut ctx.votes, msg.id);
+                                    if granted {
+                                        ctx.votes = 0;
+                                        pretty!(
+                                            self,
+                                            "{:?} probing quorum reached ({}/{})",
+                                            ctx,
+                                            n,
+                                            self.peers.len() + 1
+                                        );
+                                        return CNDT(*ctx);
+                                    }
+                                }
+                                _ => {}
+                            }
+                        }
+                    }
+                    ADVERTISE::CODE => {
+                        let msg: ADVERTISE = deserialize(&raw.msg[..]).unwrap();
+                        debug_assert!(msg.id != self.id);
+                        if msg.term < self.term {
+
+                            //
+                            // - stale peer: send back a UPGRADE
+                            //
+                            let msg = UPGRADE {
+                                id: self.id,
+                                term: self.term,
+                            };
+                            (self.write)(&raw.src, msg.to_raw(&self.host, &raw.src));
                         } else {
                             match state {
                                 CNDT(ref mut ctx) |
@@ -1200,9 +1249,7 @@ where
                                             term: self.term,
                                         };
 
-                                        (self.write)(
-                                            format!("{}", msg.to_raw(&self.host, &raw.src)),
-                                        );
+                                        (self.write)(&raw.src, msg.to_raw(&self.host, &raw.src));
                                     }
                                 }
                                 _ => {}
@@ -1210,7 +1257,7 @@ where
                         }
                     }
                     VOTE::CODE => {
-                        let msg: VOTE = serde_json::from_value(raw.user).unwrap();
+                        let msg: VOTE = deserialize(&raw.msg[..]).unwrap();
                         debug_assert!(msg.id != self.id);
                         if msg.term < self.term {
 
@@ -1221,36 +1268,25 @@ where
                                 id: self.id,
                                 term: self.term,
                             };
-                            (self.write)(format!("{}", msg.to_raw(&self.host, &raw.src)));
+                            (self.write)(&raw.src, msg.to_raw(&self.host, &raw.src));
                         } else {
                             match state {
-                                PREV(ref mut ctx) => {
-
-                                    //
-                                    // - we are in the pre-voting phase
-                                    // - this vote does not count, we are just using it to
-                                    //   check if we can reach quorum or not
-                                    // - this is like testing for reachability
-                                    // - if we get quorum transition to CANDIDATE to trigger the
-                                    //   real election (and reset the votes bit array)
-                                    //
-                                    if self.add_vote(&mut ctx.votes, msg.id) {
-                                        ctx.votes = 0;
-                                        pretty!(
-                                            self,
-                                            "{:?} probe quorum, requesting election",
-                                            ctx
-                                        );
-                                        return CNDT(*ctx);
-                                    }
-                                }
                                 CNDT(ref mut ctx) => {
 
                                     //
                                     // - same as above except this is the real election
                                     // - if we reach quorum this time transition to LEADER
                                     //
-                                    if self.add_vote(&mut ctx.votes, msg.id) {
+                                    let (n, granted) = self.count_votes(&mut ctx.votes, msg.id);
+                                    if granted {
+                                        ctx.votes = 0;
+                                        pretty!(
+                                            self,
+                                            "{:?} voting quorum reached ({}/{})",
+                                            ctx,
+                                            n,
+                                            self.peers.len() + 1
+                                        );
                                         return LEAD(Default::default());
                                     }
                                 }
@@ -1288,13 +1324,38 @@ impl Protocol {
         guard: Arc<Guard>,
         id: u8,
         host: String,
+        seeds: Option<HashMap<u8, String>>,
         write: T,
         logger: Logger,
     ) -> (Self, Arc<Sink>)
     where
-        T: 'static + Send + Fn(String) -> (),
+        T: 'static + Send + Fn(&String, Vec<u8>) -> (),
     {
+        //
+        // - turn the specified id/host mapping into our peer map
+        // - make sure to remove any entry that would be using our peer id
+        //
+        let peers: HashMap<_, _> = if let Some(mut map) = seeds {
+            map.retain(|&n, _| n != id);
+            map.iter()
+                .map(|(n, h)| {
+                    (
+                        *n,
+                        Peer {
+                            host: h.clone(),
+                            off: 1,
+                            ack: 1,
+                        },
+                    )
+                })
+                .collect()
+        } else {
+            HashMap::new()
+        };
 
+        //
+        // -
+        //
         let sink = Arc::new(Sink::new());
         let fsm = Automaton::spawn(
             guard.clone(),
@@ -1307,7 +1368,7 @@ impl Protocol {
                 head: 1,
                 age: 0,
                 commit: 1,
-                peers: HashMap::new(),
+                peers,
                 timer: Timer::spawn(guard.clone()),
                 log: Vec::new(),
                 sink: sink.clone(),
@@ -1325,8 +1386,19 @@ impl Protocol {
     }
 
     #[allow(dead_code)]
-    pub fn read(&self, raw: RAW) -> () {
-        let _ = self.fsm.post(MESSAGE(raw));
+    pub fn feed(&self, bytes: Vec<u8>) -> () {
+
+        //
+        // - unpack the incoming byte stream
+        // - cast to a RAW
+        // - silently discard if invalid
+        //
+        match deserialize(&bytes[..]) {
+            Ok(raw) => {
+                let _ = self.fsm.post(INCOMING(raw));
+            }
+            _ => {}
+        }
     }
 
     #[allow(dead_code)]
