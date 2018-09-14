@@ -4,6 +4,8 @@
 //! election cycle is randomized to avoid herding as well. The underlying automaton mechanism
 //! is wait-free and built on atomics.
 //!
+//! The basic state diagram is:
+//!
 //! ```ignore
 //!                <---------------+---------------+--------------+
 //!                                |               |              |
@@ -12,27 +14,35 @@
 //!                                <---------------+
 //! ```
 //!
-//!  # Todo
-//!      - snapshotting
-//!      - membership add()/remove()
-//!      - 'voted for' must be persisted (e.g persist an empty _NO_VOTE file under /tmp for a given
-//!        term and erase it as soon as we're not candidate anymore)
-//!
 //!  # Capacity
 //!
-//!   This implementation offers the following upper bounds:
+//!   This implementation offers the following properties:
 //!     - up to 64 peers
-//!     - up to 4000G terms
-//!     - log up to 65K entries
+//!     - all offsets on 64bits
+//!     - pre-vote phase
+//!
+//!  # Log implementation
+//!
+//! ```ignore
+//!
+//!          boundary #n                           boundary #n+1
+//!
+//!              |<-       compaction window #n       ->|
+//!              +-------------------------------------------------+---------------> offsets
+//!             tail                   |                          head
+//!                                  commit
+//! ```
 //!
 //!  # Impementation notes
 //!
-//!   * In case of replication conflict the follower will ask the leader to rewind using a simple
-//!     exponential backoff potentially down to the first offset.
-//!
-//!   * The term is a 42 bits quantity while the offset is on 16 bits (65K entries max). The last
-//!     and previous offset/term comparisons to maintain the log up-do-date are done by using a
-//!     single u64 packed as | term | offset |.
+//!   * Instead of initializing the offsets to 0 we force a dummy entry at #1 to simply the code.
+//!   * The original raft protocol has been slightly changed around compaction and how we handle
+//!     conflicts. This implementation is simpler in the sense we always force a peer rebase at
+//!     the last compaction boundary.
+//!   * The automaton maintains a variable log window tracked by a head and tail offsets. The
+//!     commit offset is always located in that window. This window is compacted whenever the
+//!     distance between the commit and tail offsets reaches a predefined threshold. The tail
+//!     offset will therefore always be a multiple of this threshold.
 //!
 //!  # Ideas
 //!
@@ -66,7 +76,6 @@ mod context {
     #[derive(Copy, Clone, Default, PartialEq)]
     pub struct FLWR {
         pub live: bool,
-        pub conflicts: u8,
         pub leader: Option<u8>,
     }
 
@@ -150,26 +159,41 @@ pub struct Protocol {
 }
 
 struct Peer {
+    /// Peer network identifier.
     host: String,
-    off: u16,
-    ack: u16,
+    /// Write offset on that peer, e.g offset after which new entries will be appened. Please note
+    /// this may not be its current head. It is initially set to the leader's head offset.
+    off: u64,
+    /// Last acknowledged offset (e.g commit offset).
+    ack: u64,
 }
 
+
+///  todo items:
+///    o) snapshotting
+///    o) membership add()/remove()
+///    o) the latest vote must be persisted (e.g persist an empty _NO_VOTE file under /tmp for a
+///       given term and erase it as soon as we're not candidate anymore ?)
 struct FSM<T>
 where
     T: 'static + Send + Fn(String) -> (),
 {
-    /// Local peer index in [0, 64]
+    /// Local peer index in [0, 64].
     id: u8,
+    /// Local network identifier.
     host: String,
-    /// Sequence counter, used to disambiguiate timeouts
+    /// Sequence counter, used to disambiguiate timeouts.
     seq: u64,
-    /// Current term, persisted
+    /// Current peer term, persisted.
     term: u64,
-    /// Current log tail (e.g term|offset of the last log entry, 0 if empty)
+    /// Last log offset we maintain, starts at #1.
+    head: u64,
+    /// First log offset we maintain, starts at #1.
     tail: u64,
-    /// Commit offset
-    commit: u16,
+    /// Term at the log tail (e.g how long ago was that entry appended).
+    age: u64,
+    /// Current commit offset, as reported by a quorum, starts at #1.
+    commit: u64,
     peers: HashMap<u8, Peer>,
     timer: Timer<Command>,
     log: Vec<LogEntry>,
@@ -182,20 +206,9 @@ macro_rules! pretty {
     ($self:ident, $fmt:expr $(, $arg:expr)*) => {
         debug!(&$self.logger, $fmt, $($arg),* ;
             "term" => $self.term,
-            "log" => $self.log.len(),
+            "head" => $self.head,
+            "tail" => $self.tail,
             "commit" => $self.commit);
-    };
-}
-
-macro_rules! pack {
-    ($off:expr, $term:expr) => {
-        ($term << 16) + $off as u64
-    };
-}
-
-macro_rules! unpack {
-    ($n:expr) => {
-        ($n as u16, $n >> 16)
     };
 }
 
@@ -205,6 +218,7 @@ where
 {
     const LIVENESS_TIMEOUT: u64 = 3000;
     const ELECTION_TIMEOUT: u64 = 250;
+    const DISKIO_THRESHOLD: u64 = 9;
 
     fn add_vote(&self, votes: &mut u64, id: u8) -> bool {
 
@@ -241,20 +255,32 @@ where
                 //
                 // - fake a cluster setup with 3 nodes on localhost
                 //
-                for n in 0..2 {
+                for n in 0..3 {
                     self.peers.insert(
                         n,
                         Peer {
                             host: format!("127.0.0.1:900{}", n),
-                            off: 0,
-                            ack: 0,
+                            off: 1,
+                            ack: 1,
                         },
                     );
                 }
 
                 //
+                // - by definition offset #1 is some empty marker
+                // - we use this to avoid having to perform a bunch of == 0 tests
+                //
+                debug_assert!(self.head == 1);
+                debug_assert!(self.tail == 1);
+                debug_assert!(self.commit == 1);
+                self.log.push(LogEntry {
+                    term: 0,
+                    blob: String::new(),
+                });
+
+                //
                 // - we start as a FOLLOWER
-                // - set the liveness timeout
+                // - set the first liveness timeout
                 //
                 self.timer.schedule(
                     this.clone(),
@@ -297,12 +323,13 @@ where
                         //
                         // - we were just elected LEADER
                         // - reset the next/replication counters for each peer
+                        // - the peer offsets are set to our head offset
                         //
                         pretty!(self, "{:?} now leading", ctx);
                         for peer in &mut self.peers {
                             if *peer.0 != self.id {
-                                peer.1.off = self.log.len() as u16;
-                                peer.1.ack = 0;
+                                peer.1.off = self.head;
+                                peer.1.ack = 1;
                             }
                         }
 
@@ -343,18 +370,20 @@ where
                         //
                         // - we did not get a quorum, meaning it's useless to switch
                         //   to CANDIDATE at this point
-                        // - send a CHECK to all our peers, the goal being to
-                        //   estimate how many would agree to vote for us
+                        // - send a PROBE to all our peers, the goal being to
+                        //   estimate how many would agree to vote for us as long as
+                        //   they at least match our head
                         // - the term we pass is our term + 1
                         //
                         ctx.pick = None;
                         for peer in &self.peers {
                             if *peer.0 != self.id {
 
-                                let msg = CHECK {
+                                let msg = PROBE {
                                     id: self.id,
                                     term: self.term + 1,
-                                    tail: self.tail,
+                                    head: self.head,
+                                    age: self.age,
                                 };
                                 (self.write)(format!("{}", msg.to_raw(&self.host, &peer.1.host)));
                             }
@@ -395,7 +424,8 @@ where
                                 let msg = ADVERTISE {
                                     id: self.id,
                                     term: self.term,
-                                    tail: self.tail,
+                                    head: self.head,
+                                    age: self.age,
                                 };
                                 (self.write)(format!("{}", msg.to_raw(&self.host, &peer.1.host)));
                             }
@@ -411,7 +441,6 @@ where
                             TIMEOUT(self.seq),
                             Duration::from_millis(FSM::<T>::ELECTION_TIMEOUT),
                         );
-
                     }
                     FLWR(ref mut ctx) => {
                         if ctx.live {
@@ -445,71 +474,111 @@ where
                     LEAD(ref ctx) => {
 
                         //
-                        // - assert our authority by sending a REPLICATE to all our peers
+                        // - assert our authority by sending a PING to all our peers
                         // - any peer receiving those will turn into a FOLLOWER if not already
                         //   the case
                         //
                         // @todo better manager idle times vs. dirty state
                         //
-                        let end = self.log.len() as u16;
                         for peer in &mut self.peers {
                             if *peer.0 != self.id {
 
-                                //
-                                // - prep a buffer
-                                // - check if we need to replicate
-                                //
-                                let mut append = Vec::new();
-                                debug_assert!(end >= peer.1.ack);
-                                debug_assert!(end >= peer.1.off);
-                                debug_assert!(peer.1.off >= peer.1.ack);
-                                if end > peer.1.off {
-
-                                    //
-                                    // - we have 1+ log entries to replicate
-                                    // - copy entries from [off + 1, end] to our buffer
-                                    //
-                                    let size = end - peer.1.off;
-                                    pretty!(
-                                        self,
-                                        "{:?} replicating [#{} .. #{}] to peer #{}",
-                                        ctx,
-                                        peer.1.off + 1,
-                                        end,
-                                        peer.0
-                                    );
-                                    for n in 0..size {
-                                        append.push(self.log[(peer.1.off + n) as usize].clone());
-                                    }
-                                }
-
-                                //
-                                // - pack the index+term for the write offset (e.g the offset
-                                //   immediately preceding the first replicated entry)
-                                // - even if we have no entries to replicate this will force the
-                                //   FOLLOWER to check its log and flag any conflict
-                                // - blank peers will also be able to synch-up this way
-                                //
-                                let check = if peer.1.off > 0 {
-                                    pack!(peer.1.off, self.log[peer.1.off as usize - 1].term)
-                                } else {
-                                    0
-                                };
-
-                                //
-                                // - update the offset for that peer
-                                // - fire the REPLICATE
-                                //
-                                peer.1.off = end;
-                                let msg = REPLICATE {
+                                let msg = PING {
                                     id: self.id,
                                     term: self.term,
                                     commit: self.commit,
-                                    check,
-                                    append,
                                 };
 
                                 (self.write)(format!("{}", msg.to_raw(&self.host, &peer.1.host)));
+                                debug_assert!(peer.1.off <= self.head);
+                                if self.head > peer.1.off {
+
+                                    //
+                                    // - we have entries to replicate
+                                    // - prep a append buffer
+                                    // - check if we need to replicate
+                                    //
+                                    let mut append = Vec::new();
+                                    debug_assert!(self.head >= peer.1.ack);
+                                    debug_assert!(self.head >= peer.1.off);
+                                    debug_assert!(peer.1.off >= peer.1.ack);
+                                    let rebase = if peer.1.off < self.tail {
+
+                                        //
+                                        // - if the peer is behind our log window bump it
+                                        // - the rebase flag will force it to align with us
+                                        // - copy the whole log window to the append buffer
+                                        // - please note 1+ commit notifications will thus be lost
+                                        //   on that peer (at least the peer will notify it was
+                                        //   rebased)
+                                        //
+                                        pretty!(
+                                            self,
+                                            "{:?} bumping peer #{} to offset #{} (lag ?)",
+                                            ctx,
+                                            peer.0,
+                                            self.tail
+                                        );
+                                        peer.1.off = self.tail;
+                                        let size = self.head - self.tail + 1;
+                                        for n in 0..size {
+                                            append.push(self.log[n as usize].clone());
+                                        }
+                                        true
+
+                                    } else {
+
+                                        //
+                                        // - we have 1+ log entries to replicate
+                                        // - copy entries from [off + 1, head] to the append buffer
+                                        //
+                                        let size = self.head - peer.1.off;
+                                        pretty!(
+                                            self,
+                                            "{:?} replicating [#{} .. #{}] to peer #{}",
+                                            ctx,
+                                            peer.1.off + 1,
+                                            self.head,
+                                            peer.0
+                                        );
+                                        for n in 0..size {
+                                            append.push(
+                                                self.log[(peer.1.off + 1 - self.tail + n) as
+                                                             usize]
+                                                    .clone(),
+                                            );
+                                        }
+                                        false
+                                    };
+
+                                    //
+                                    // - specify the index+term for the write offset (e.g the offset
+                                    //   immediately preceding the first replicated entry)
+                                    // - even if we have no entries to replicate this will force the
+                                    //   FOLLOWER to check its log and flag any conflict
+                                    // - blank peers will also be able to synch-up this way
+                                    // - emit a REPLICATE
+                                    //
+                                    debug_assert!(append.len() > 0);
+                                    let msg = REPLICATE {
+                                        id: self.id,
+                                        term: self.term,
+                                        commit: self.commit,
+                                        off: peer.1.off,
+                                        age: self.log[(peer.1.off - self.tail) as usize].term,
+                                        append,
+                                        rebase,
+                                    };
+
+                                    (self.write)(
+                                        format!("{}", msg.to_raw(&self.host, &peer.1.host)),
+                                    );
+
+                                    //
+                                    // - update the offset for that peer
+                                    //
+                                    peer.1.off = self.head;
+                                }
                             }
                         }
 
@@ -528,23 +597,24 @@ where
             }
             Opcode::INPUT(STORE(blob)) => {
                 match state {
-                    LEAD(ref ctx) => {
-                        
+                    LEAD(ref _ctx) => {
+
                         //
                         // - add the entry to our log
                         //
-                        pretty!(self, "{:?} log <- '{}' <- local", ctx, blob);
                         self.log.push(LogEntry {
                             term: self.term,
                             blob,
                         });
-                        self.tail = pack!(self.log.len() as u16, self.term);
 
                         //
-                        // - replicate immediately
+                        // - increment the head offset
+                        // - update the term tracker for the head
+                        // - set the tail offset to #1 upon the first append
                         //
-                        self.seq += 1;
-                        let _ = this.post(TIMEOUT(self.seq));
+                        self.head += 1;
+                        self.age = self.term;
+                        debug_assert!(self.log.len() == (1 + self.head - self.tail) as usize);
                     }
                     FLWR(ref ctx) => {
                         if let Some(id) = ctx.leader {
@@ -584,23 +654,26 @@ where
 
                         } else {
                             match state {
-                                LEAD(ref ctx) => {
+                                LEAD(ref _ctx) => {
 
                                     //
                                     // - add the entry to our log
                                     //
-                                    pretty!(self, "{:?} log <- '{}' <- peer #{}", ctx, msg.blob, msg.id);
                                     self.log.push(LogEntry {
                                         term: self.term,
                                         blob: msg.blob,
                                     });
-                                    self.tail = pack!(self.log.len() as u16, self.term);
 
                                     //
-                                    // - replicate immediately
+                                    // - increment the head offset
+                                    // - update the term tracker for the head
+                                    // - set the tail offset to #1 upon the first append
                                     //
-                                    self.seq += 1;
-                                    let _ = this.post(TIMEOUT(self.seq));
+                                    self.head += 1;
+                                    self.age = self.term;
+                                    debug_assert!(
+                                        self.log.len() == (1 + self.head - self.tail) as usize
+                                    );
                                 }
                                 _ => {}
                             }
@@ -618,18 +691,20 @@ where
                             // - increment the sink semaphore
                             // - always transition to FOLLOWER without a leader (yet)
                             //
+                            // @note should we just nuke our log/state and wait for the leader
+                            // to synch us back?
+                            //
                             self.term = msg.term;
                             self.sink.fifo.push(Notification::IDLE);
                             self.sink.sem.signal();
                             return FLWR(context::FLWR {
                                 live: false,
-                                conflicts: 0,
                                 leader: None,
                             });
                         }
                     }
-                    REPLICATE::CODE => {
-                        let mut msg: REPLICATE = serde_json::from_value(raw.user).unwrap();
+                    PING::CODE => {
+                        let mut msg: PING = serde_json::from_value(raw.user).unwrap();
                         debug_assert!(msg.id != self.id);
                         if msg.term < self.term {
 
@@ -658,7 +733,6 @@ where
                                     self.sink.sem.signal();
                                     return FLWR(context::FLWR {
                                         live: true,
-                                        conflicts: 0,
                                         leader: Some(msg.id),
                                     });
                                 }
@@ -675,118 +749,45 @@ where
                                     }
 
                                     //
-                                    // - upgrade our term if we are stale
                                     // - set the live trigger
+                                    // - upgrade our term if we are stale
+                                    // - make sure we update our leader id if needed
                                     //
                                     ctx.live = true;
-                                    ctx.leader = Some(msg.id);
                                     self.term = msg.term;
+                                    ctx.leader = Some(msg.id);
 
                                     //
-                                    // - notify the sink with a COMMIT for each entry
-                                    // - update our commit offset up to the leader's offset
-                                    // - increment the sink semaphore
+                                    // -
                                     //
-                                    //   "If leaderCommit > commitIndex, set commitIndex =
-                                    //    min(leaderCommit, index of last new entry)"
-                                    //
-                                    let end = self.log.len() as u16;
-                                    if msg.commit > self.commit {
-                                        let updated = cmp::min(msg.commit, end);
-                                        pretty!(self, "{:?} commit now at #{}", ctx, updated);
-                                        for n in self.commit..updated {
-                                            self.sink.fifo.push(Notification::COMMIT(
-                                                self.log[n as usize].blob.clone(),
-                                            ));
-                                            self.sink.sem.signal();
-                                        }
-                                        self.commit = updated;
-                                    }
-
-                                    //
-                                    // - consider the check mark passed down by the LEADER
-                                    // - we want to make sure we a) have the specified offset in
-                                    //   our log and b) that its term is the one we expect
-                                    // - failure to do so mean we either are missing data (e.g
-                                    //   we are catching up after, say, a reboot), or we have some
-                                    //   amount of corruption
-                                    // - note: a check mark with a zero value only means we have
-                                    //   no log at all (e.g the node just joined the cluster)
-                                    // - this is conveyed in the original paper as
-                                    //
-                                    //   "Reply false if log doesn’t contain an entry at
-                                    //    prevLogIndex whose term matches prevLogTerm (§5.3)"
-                                    //
-                                    let n = msg.append.len() as u16;
-                                    let (off, term) = unpack!(msg.check);
-                                    if off == 0 ||
-                                        (off <= end && self.log[off as usize - 1].term == term)
-                                    {
-                                        //
-                                        // - reset the conflict counter
-                                        //
-                                        ctx.conflicts = 0;
-                                        if n > 0 {
-
-                                            //
-                                            // - the specified log offset matches
-                                            // - now this offset may not be our tail, therefore
-                                            //   truncate() to drop all subsequent entries
-                                            // - then transfer the entries to append at the end
-                                            // - this is conveyed in the original paper as
-                                            //
-                                            //   "If an existing entry conflicts with a new one
-                                            //    (same index but different terms), delete the
-                                            //    existing entry and all that follow it (§5.3)
-                                            //    Append any new entries not already in the log"
-                                            //
-                                            self.log.truncate(off as usize);
-                                            self.log.append(&mut msg.append);
-                                            let ack = self.log.len() as u16;
-                                            self.tail = pack!(ack, self.term);
-                                            pretty!(self, "{:?} #{} now replicated", ctx, ack);
-                                            let msg = CONFIRM {
-                                                id: self.id,
-                                                term: self.term,
-                                                ack,
-                                            };
-
-                                            (self.write)(
-                                                format!("{}", msg.to_raw(&self.host, &raw.src)),
-                                            );
-                                        }
-
-                                    } else {
-
-                                        //
-                                        // - we can't validate the proposed check mark
-                                        // - reply with a CONFLICT and propose to re-replicate
-                                        //   starting at an earlier offset (e.g the previous one)
-                                        // - use a simple exponential rewind strategy where we ask
-                                        //   the LEADER to go back in the log with increasingly
-                                        //   large steps
-                                        //
-                                        debug_assert!(off > 0);
-                                        let rewind = cmp::min(1 << ctx.conflicts, off);
-                                        ctx.conflicts += 1;
+                                    let next = cmp::min(msg.commit, self.head);
+                                    if next > self.commit {
+                                        debug_assert!(next >= self.tail);
+                                        self.commit = next;
                                         pretty!(
                                             self,
-                                            "{:?} conflict at #{}/T{}, asking for #{} ({}/4)",
+                                            "{:?} offset #{} committed",
                                             ctx,
-                                            off,
-                                            term,
-                                            off - rewind,
-                                            ctx.conflicts
+                                            self.commit
                                         );
-                                        let msg = CONFLICT {
-                                            id: self.id,
-                                            term: self.term,
-                                            try: off - rewind,
-                                        };
 
-                                        (self.write)(
-                                            format!("{}", msg.to_raw(&self.host, &raw.src)),
-                                        );
+                                        //
+                                        // -
+                                        //
+                                        while self.commit - self.tail >=
+                                            FSM::<T>::DISKIO_THRESHOLD
+                                        {
+
+                                            // snapshot
+
+                                            let mut buf = Vec::new();
+                                            self.tail += FSM::<T>::DISKIO_THRESHOLD;
+                                            buf.extend_from_slice(
+                                                &self.log[FSM::<T>::DISKIO_THRESHOLD as usize..],
+                                            );
+                                            self.log = buf;
+                                            pretty!(self, "{:?} compacted log", ctx);
+                                        }
                                     }
                                 }
                                 LEAD(ref ctx) => {
@@ -812,15 +813,158 @@ where
                                     self.sink.sem.signal();
                                     return FLWR(context::FLWR {
                                         live: true,
-                                        conflicts: 0,
                                         leader: Some(msg.id),
                                     });
                                 }
                             }
                         }
                     }
-                    CONFIRM::CODE => {
-                        let msg: CONFIRM = serde_json::from_value(raw.user).unwrap();
+                    REPLICATE::CODE => {
+                        let mut msg: REPLICATE = serde_json::from_value(raw.user).unwrap();
+                        debug_assert!(msg.id != self.id);
+                        if msg.term < self.term {
+
+                            //
+                            // - stale peer: send back a UPGRADE
+                            //
+                            let msg = UPGRADE {
+                                id: self.id,
+                                term: self.term,
+                            };
+                            (self.write)(format!("{}", msg.to_raw(&self.host, &raw.src)));
+
+                        } else {
+                            match state {
+                                FLWR(ref mut ctx) if msg.rebase => {
+
+                                    //
+                                    // - reset our log using the append buffer
+                                    // - override our tail and head offsets
+                                    //
+                                    self.log.clear();
+                                    self.log.append(&mut msg.append);
+                                    self.tail = msg.off;
+                                    self.age = self.log.last().unwrap().term;
+                                    self.head = self.tail + self.log.len() as u64 - 1;
+                                    pretty!(self, "{:?} rebased at offset #{}", ctx, msg.off);
+                                    debug_assert!(
+                                        self.log.len() == (1 + self.head - self.tail) as usize
+                                    );
+
+                                    //
+                                    // - emit a ACK to acknowledge our new head offset
+                                    //
+                                    let msg = ACK {
+                                        id: self.id,
+                                        term: self.term,
+                                        ack: self.head,
+                                    };
+
+                                    (self.write)(format!("{}", msg.to_raw(&self.host, &raw.src)));
+                                }
+                                FLWR(ref mut ctx) => {
+
+                                    //
+                                    // - consider the check mark passed down by the LEADER
+                                    // - we want to make sure we a) have the specified offset in
+                                    //   our log and b) that its term is the one we expect
+                                    // - failure to do so mean we either are missing data (e.g
+                                    //   we are catching up after, say, a reboot), or we have some
+                                    //   amount of corruption
+                                    // - note: a check mark with a zero value only means we have
+                                    //   no log at all (e.g the node just joined the cluster)
+                                    // - this is conveyed in the original paper as
+                                    //
+                                    //   "Reply false if log doesn’t contain an entry at
+                                    //    prevLogIndex whose term matches prevLogTerm (§5.3)"
+                                    //
+                                    let n = msg.append.len() as u64;
+                                    debug_assert!(n > 0);
+                                    debug_assert!(msg.off >= self.tail);
+                                    let off = (msg.off - self.tail) as usize;
+                                    if msg.off <= self.head && self.log[off].term == msg.age {
+
+                                        //
+                                        // - the specified log offset matches
+                                        // - now this offset may not be our head, therefore
+                                        //   truncate() to drop all subsequent entries
+                                        // - then transfer the entries to append at the head
+                                        // - this is conveyed in the original paper as
+                                        //
+                                        //   "If an existing entry conflicts with a new one
+                                        //    (same index but different terms), delete the
+                                        //    existing entry and all that follow it (§5.3)
+                                        //    Append any new entries not already in the log"
+                                        //
+                                        // - force the tail offset to 1 if this is the first
+                                        //   append on this peer
+                                        //
+                                        if self.tail == 0 {
+                                            self.tail = 1;
+                                        }
+
+                                        //
+                                        // - truncate/append at the specified offset
+                                        // - udpate our head offset
+                                        //
+                                        self.log.truncate(off + 1);
+                                        self.log.append(&mut msg.append);
+                                        debug_assert!(self.log.len() > 0);
+                                        self.age = self.log.last().unwrap().term;
+                                        self.head = self.tail + self.log.len() as u64 - 1;
+                                        debug_assert!(
+                                            self.log.len() == (1 + self.head - self.tail) as usize
+                                        );
+
+                                        //
+                                        // - emit a ACK to acknowledge our new head offset
+                                        //
+                                        let msg = ACK {
+                                            id: self.id,
+                                            term: self.term,
+                                            ack: self.head,
+                                        };
+
+                                        (self.write)(
+                                            format!("{}", msg.to_raw(&self.host, &raw.src)),
+                                        );
+                                        pretty!(self, "{:?} #{} now replicated", ctx, self.head);
+
+                                    } else {
+
+                                        //
+                                        // - we can't validate the proposed check mark
+                                        // - reply with a REBASE and propose to re-replicate
+                                        //   starting at an earlier offset (e.g the previous one)
+                                        // - use a simple exponential rewind strategy where we ask
+                                        //   the LEADER to go back in the log with increasingly
+                                        //   large steps
+                                        //
+                                        debug_assert!(msg.off > 0);
+                                        pretty!(
+                                            self,
+                                            "{:?} conflict at [#{}|{}], rebasing",
+                                            ctx,
+                                            msg.off,
+                                            msg.age
+                                        );
+
+                                        let msg = REBASE {
+                                            id: self.id,
+                                            term: self.term,
+                                        };
+
+                                        (self.write)(
+                                            format!("{}", msg.to_raw(&self.host, &raw.src)),
+                                        );
+                                    }
+                                }
+                                _ => {}
+                            }
+                        }
+                    }
+                    ACK::CODE => {
+                        let msg: ACK = serde_json::from_value(raw.user).unwrap();
                         debug_assert!(msg.id != self.id);
                         if msg.term < self.term {
 
@@ -853,7 +997,8 @@ where
                                     //   count ourselves (we are maintaining the log)
                                     //
                                     let mut n = 1;
-                                    let mut smallest = <u16>::max_value();
+                                    let mut smallest = <u64>::max_value();
+                                    debug_assert!(msg.ack <= self.head);
                                     for peer in &mut self.peers {
                                         if *peer.0 != self.id {
 
@@ -889,7 +1034,6 @@ where
                                     // - do we have quorum ?
                                     //
                                     if n > self.peers.len() >> 1 {
-                                        pretty!(self, "{:?} commit now at #{}", ctx, smallest);
 
                                         //
                                         // - notify the sink with a COMMIT for each entry
@@ -897,22 +1041,43 @@ where
                                         //   offset reported by the quorum peers
                                         // - signal the sink event
                                         //
-                                        debug_assert!(smallest > 0);
+                                        debug_assert!(smallest >= self.tail);
                                         for n in self.commit..smallest {
                                             self.sink.fifo.push(Notification::COMMIT(
-                                                self.log[n as usize].blob.clone(),
+                                                self.log[(n - self.tail) as usize]
+                                                    .blob
+                                                    .clone(),
                                             ));
                                             self.sink.sem.signal();
                                         }
                                         self.commit = smallest;
+                                        pretty!(self, "{:?} offset #{} committed", ctx, smallest);
+
+                                        //
+                                        // -
+                                        //
+                                        while self.commit - self.tail >=
+                                            FSM::<T>::DISKIO_THRESHOLD
+                                        {
+
+                                            // snapshot
+
+                                            let mut buf = Vec::new();
+                                            self.tail += FSM::<T>::DISKIO_THRESHOLD;
+                                            buf.extend_from_slice(
+                                                &self.log[FSM::<T>::DISKIO_THRESHOLD as usize..],
+                                            );
+                                            self.log = buf;
+                                            pretty!(self, "{:?} compacted log", ctx);
+                                        }
                                     }
                                 }
                                 _ => {}
                             }
                         }
                     }
-                    CONFLICT::CODE => {
-                        let msg: CONFLICT = serde_json::from_value(raw.user).unwrap();
+                    REBASE::CODE => {
+                        let msg: REBASE = serde_json::from_value(raw.user).unwrap();
                         debug_assert!(msg.id != self.id);
                         if msg.term < self.term {
 
@@ -927,39 +1092,23 @@ where
 
                         } else {
                             match state {
-                                LEAD(mut ctx) => {
+                                LEAD(_) => {
 
                                     //
                                     // - the FOLLOWER is unable to match the check mark we
-                                    //   specified during replication: update its write offset
-                                    //   (usually decrementing it)
-                                    // - make sure to potentially reset the acknowledged offset
-                                    //   as well
+                                    //   specified during replication: reset the peer offsets
+                                    // - we will rebase it upon the next heartbeat
                                     //
                                     let mut peer = self.peers.get_mut(&msg.id).unwrap();
-                                    pretty!(
-                                        self,
-                                        "{:?} peer #{} offset reset to #{} (conflict)",
-                                        ctx,
-                                        msg.id,
-                                        msg.try
-                                    );
-                                    debug_assert!(msg.try < peer.off);
-                                    peer.ack = cmp::min(peer.ack, msg.try);
-                                    peer.off = msg.try;
-
-                                    //
-                                    // - replicate immediately
-                                    //
-                                    self.seq += 1;
-                                    let _ = this.post(TIMEOUT(self.seq));
+                                    peer.off = 1;
+                                    peer.ack = 0;
                                 }
                                 _ => {}
                             }
                         }
                     }
-                    CHECK::CODE => {
-                        let msg: CHECK = serde_json::from_value(raw.user).unwrap();
+                    PROBE::CODE => {
+                        let msg: PROBE = serde_json::from_value(raw.user).unwrap();
                         debug_assert!(msg.id != self.id);
                         if msg.term < self.term {
 
@@ -980,10 +1129,9 @@ where
                                     // - always grant the pre-vote as long as we are not
                                     //   either FOLLOWER or LEADER and as long as the peer log
                                     //   is at least as up-to-date as ours
-                                    // - we pack the tail composite offset in such way we can
-                                    //   directly compare in one shot
                                     //
-                                    if msg.tail >= self.tail {
+                                    if msg.age < self.age || msg.head < self.head {
+                                    } else {
 
                                         let msg = VOTE {
                                             id: self.id,
@@ -1033,7 +1181,7 @@ where
                                     //   log at least as up-to-date as ours (see above)
                                     //
                                     let granted = match ctx.pick {
-                                        _ if msg.tail < self.tail => false,
+                                        _ if msg.age < self.age || msg.head < self.head => false,
                                         Some(id) if id == msg.id => true,
                                         None => true,
                                         _ => false,
@@ -1088,6 +1236,11 @@ where
                                     //
                                     if self.add_vote(&mut ctx.votes, msg.id) {
                                         ctx.votes = 0;
+                                        pretty!(
+                                            self,
+                                            "{:?} probe quorum, requesting election",
+                                            ctx
+                                        );
                                         return CNDT(*ctx);
                                     }
                                 }
@@ -1150,8 +1303,10 @@ impl Protocol {
                 host,
                 seq: 0,
                 term: 0,
-                tail: 0,
-                commit: 0,
+                tail: 1,
+                head: 1,
+                age: 0,
+                commit: 1,
                 peers: HashMap::new(),
                 timer: Timer::spawn(guard.clone()),
                 log: Vec::new(),

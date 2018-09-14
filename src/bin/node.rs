@@ -102,9 +102,19 @@ fn main() {
             }
         });
     }
+    
     {
-
+        let raft = raft.clone();
+        let _ = thread::spawn(move || {
+            let mut n = 0;
+            loop {
+                raft.store(format!("#{}-#{}", id, n));
+                thread::sleep_ms(1000);
+                n += 1;
+            }
+        });
     }
+    
 
     //
     // - trap SIGINT/SIGTERM and drain the state machine
@@ -118,22 +128,17 @@ fn main() {
     }
     loop {
         match sink.next() {
-            None => break,            
-            Some(Notification::COMMIT(blob)) => {
-                info!(&log, "data -> <{}>", blob);
-            }
-            Some(notif) => {
-                info!(&log, "notif: {:?}", notif);
-                match notif {
-                    Notification::FOLLOWING => {
-
-                        //
-                        // -
-                        //
-                        raft.store(format!("hello i am peer #{} !", id));
-                    }
-                    _ => {}
+            None => break,     
+            Some(Notification::COMMIT(_)) => {},  
+            /*
+            Some(Notification::LEADING) => {
+                for n in 0..9 {
+                    raft.store(format!("#{}-#{}", id, n));
                 }
+            },
+            */
+            Some(notif) => {
+                info!(&log, "> {:?}", notif);
             }
         }
     }

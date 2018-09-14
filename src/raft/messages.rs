@@ -42,26 +42,34 @@ pub struct LogEntry {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
+pub struct PING {
+    pub id: u8,
+    pub term: u64,
+    pub commit: u64,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
 pub struct REPLICATE {
     pub id: u8,
     pub term: u64,
-    pub check: u64,
-    pub commit: u16,
+    pub off: u64,
+    pub age: u64,
+    pub commit: u64,
     pub append: Vec<LogEntry>,
+    pub rebase: bool,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
-pub struct CONFIRM {
+pub struct ACK {
     pub id: u8,
     pub term: u64,
-    pub ack: u16,
+    pub ack: u64,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
-pub struct CONFLICT {
+pub struct REBASE {
     pub id: u8,
     pub term: u64,
-    pub try: u16,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -71,17 +79,19 @@ pub struct UPGRADE {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
-pub struct CHECK {
+pub struct PROBE {
     pub id: u8,
     pub term: u64,
-    pub tail: u64,
+    pub head: u64,
+    pub age: u64,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct ADVERTISE {
     pub id: u8,
     pub term: u64,
-    pub tail: u64,
+    pub head: u64,
+    pub age: u64,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -97,11 +107,12 @@ pub struct APPEND {
     pub blob: String,
 }
 
+declare!(0, PING);
 declare!(1, REPLICATE);
-declare!(2, CONFIRM);
-declare!(3, CONFLICT);
+declare!(2, ACK);
+declare!(3, REBASE);
 declare!(4, UPGRADE);
-declare!(5, CHECK);
+declare!(5, PROBE);
 declare!(6, ADVERTISE);
 declare!(7, VOTE);
 declare!(8, APPEND);
