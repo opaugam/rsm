@@ -8,6 +8,7 @@
 #![deny(unused_imports)]
 #[cfg_attr(feature = "cargo-clippy", allow(mutex_atomic, too_many_arguments))]
 extern crate bincode;
+extern crate memmap;
 extern crate rand;
 #[macro_use]
 extern crate serde_derive;

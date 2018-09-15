@@ -1,4 +1,5 @@
 //! Sample application running multiple raft automata and allowing them exchange commands.
+extern crate bincode;
 #[macro_use]
 extern crate clap;
 extern crate ctrlc;
@@ -8,9 +9,10 @@ extern crate slog;
 extern crate slog_async;
 extern crate slog_term;
 
+use bincode::deserialize;
 use rsm::primitives::event::*;
-use rsm::raft::messages::RAW;
-use rsm::raft::protocol::Protocol;
+use rsm::raft::slots::LABEL;
+use rsm::raft::protocol::{Notification, Protocol};
 use slog::{Drain, Level, LevelFilter, Logger};
 use slog_term::{FullFormat, PlainSyncDecorator};
 use slog_async::Async;
@@ -64,7 +66,7 @@ fn main() {
     // - start a few raft automata
     // - loop and consume notifications for each
     //
-    let size = value_t!(args, "SIZE", u8).unwrap();
+    let size = value_t!(args, "SIZE", u8).unwrap_or(3);
     let peers = Arc::new(Mutex::new(HashMap::<String, Protocol>::new()));
     for n in 0..size {
 
@@ -112,11 +114,21 @@ fn main() {
             }
 
             //
-            // -
+            // - loop as long as we get notifications from the automaton
+            // - we will break automatically as soon as it shuts down
             //
             loop {
                 match sink.next() {
-                    None => break,     
+                    None => break,
+                    Some(Notification::COMMIT(off, code, bytes)) => {
+                        match code {
+                            LABEL::CODE => {
+                                let label: LABEL = deserialize(&bytes).unwrap();
+                                info!(&log.1, "commit #{} : {:?}", off, label.text);
+                            }
+                            _ => {}
+                        }
+                    }
                     Some(notif) => {
                         info!(&log.1, "> {:?}", notif);
                     }
@@ -138,7 +150,6 @@ fn main() {
     // - start consuming from the sink
     // - as soon as next() fails on a None we can move on and wait for termination
     //
-    /*
     {
         let shared = peers.clone();
         ctrlc::set_handler(move || {
@@ -152,7 +163,6 @@ fn main() {
                 peer.1.drain();
         }}).unwrap();
     }
-    */
 
     //
     // - block on the termination event

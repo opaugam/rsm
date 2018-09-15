@@ -7,6 +7,7 @@ authors = ["Olivier Paugam <opaugam@gmail.com>"]
 bincode      = "1.0"
 clap         = "2.32"
 ctrlc        = { version = "3.0", features = ["termination"] }
+memmap       = "0.6"
 rand         = "0.5"
 serde        = "1.0"
 serde_derive = "1.0"

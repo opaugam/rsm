@@ -1,10 +1,11 @@
-//! Raft protocol state machine.
+//! Raft protocol state machine backed up by a circular buffer on disk.
 //!
 //! The implementation incorporates a few additions (leader stickiness and pre-vote). The
-//! election cycle is randomized to avoid herding as well. The underlying automaton mechanism
-//! is wait-free and built on atomics.
+//! election cycle is randomized to avoid herding as well. The underlying automaton is 100%
+//! wait-free and built on atomics. Threads that need to block are synchronized on a standard
+//! condition variable.
 //!
-//! The basic state diagram is:
+//! The basic automaton state diagram is:
 //!
 //! ```ignore
 //!                <---------------+---------------+--------------+
@@ -17,9 +18,13 @@
 //!  # Capacity
 //!
 //!   This implementation offers the following properties:
-//!     - up to 64 peers
-//!     - all offsets on 64bits
-//!     - pre-vote phase
+//!     - most of the raft spec supported
+//!     - all offsets on 64 bits
+//!     - up to 64 peers in one cluster
+//!     - maximum log capacity up to whatever the backing file is
+//!     - periodic checkpointing
+//!     - I/O between peers uses byte buffers encoded using bincode
+//!     - pre-vote phase prior to triggering an election
 //!
 //!  # Log implementation
 //!
@@ -36,6 +41,10 @@
 //!  # Impementation notes
 //!
 //!   * Instead of initializing the offsets to 0 we force a dummy entry at #1 to simply the code.
+//!   * The log itself is backed by a circular buffer on disk that is memory mapped. Each slot has
+//!     a fixed maximum byte size and contains its term plus a free form user payload as a raw
+//!     byte array. The slot is encoded using bincode.
+//!   * The log has a maximum capacity that cannot be exceeded.
 //!   * The original raft protocol has been slightly changed around compaction and how we handle
 //!     conflicts. This implementation is simpler in the sense we always force a peer rebase at
 //!     the last compaction boundary.
@@ -58,9 +67,11 @@ use bincode::{serialize, deserialize};
 use fsm::automaton::{Automaton, Opcode, Recv};
 use fsm::mpsc::MPSC;
 use fsm::timer::Timer;
+use memmap::MmapMut;
 use primitives::event::*;
 use primitives::semaphore::*;
 use raft::messages::*;
+use raft::slots::*;
 use rand::{Rng, thread_rng};
 use self::Command::*;
 use self::State::*;
@@ -68,6 +79,8 @@ use slog::Logger;
 use std::cmp;
 use std::collections::HashMap;
 use std::fmt;
+use std::fs::OpenOptions;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -81,18 +94,67 @@ macro_rules! pretty {
     };
 }
 
-macro_rules! declare {
-    ($code:expr, $msg:ident) => {
-        impl $msg {
-            pub const CODE: u8 = $code;
-            pub fn to_raw(&self, src: &str, dst: &str) -> Vec<u8> {
-                let raw = RAW {
-                    code: $msg::CODE,
-                    src: src.into(),
-                    dst: dst.into(),
-                    msg: serialize(&self).unwrap(),
-                };
-                serialize(&raw).unwrap()
+macro_rules! disk {
+    ($off:expr) => {
+        (($off - 1) as usize % FSM::<T>::RESOLUTION) * FSM::<T>::SLOT_BYTES
+    };
+}
+
+macro_rules! read_slot {
+    ($self:ident, $off:expr) => {
+        {
+            let off = disk!($off);
+            let slot: SLOT = deserialize(&$self.log[off..off + FSM::<T>::SLOT_BYTES]).unwrap();
+            slot
+        }
+    };
+}
+
+macro_rules! write_slot {
+    ($self:ident, $buf:expr, $off:expr) => {
+        {
+            let off = disk!($off);
+            $self.log[off..off + $buf.len()].copy_from_slice(&$buf);
+        }
+    };
+}
+
+macro_rules! read_range {
+    ($self:ident, $buf:ident, $off:expr, $n:expr) => {
+        {
+            let start = disk!($off);
+            let end = disk!($off + $n);
+            if end < start {
+
+                //
+                // - we wrapped around the circular buffer
+                // - break the copy in 2 chunks
+                //
+                $buf.extend_from_slice(&$self.log[start..]);
+                $buf.extend_from_slice(&$self.log[..end]);
+            } else {
+                $buf.extend_from_slice(&$self.log[start..end]);
+            }
+        }
+    };
+}
+
+macro_rules! write_range {
+    ($self:ident,$buf:ident, $off:expr, $n:expr) => {
+        {
+            let start = disk!($off);
+            let end = disk!($off + $n);
+            if end < start {
+                
+                //
+                // - we wrapped around the circular buffer
+                // - break the copy in 2 chunks
+                //
+                let cut = FSM::<T>::RESOLUTION * FSM::<T>::SLOT_BYTES - start;
+                $self.log[start..].copy_from_slice(&$buf[..cut]);
+                $self.log[..end].copy_from_slice(&$buf[cut..]);
+            } else {
+                $self.log[start..end].copy_from_slice(&$buf);
             }
         }
     };
@@ -143,7 +205,7 @@ mod context {
 
 pub enum Command {
     INCOMING(RAW),
-    STORE(String),
+    STORE(Vec<u8>),
     TIMEOUT(u64),
     HEARTBEAT,
 }
@@ -228,31 +290,28 @@ where
     commit: u64,
     /// Map of peer id <-> host + offsets
     peers: HashMap<u8, Peer>,
+    /// Internal timer automaton
     timer: Timer<Command>,
-    log: Vec<LogEntry>,
+    /// Memory mapped log file on disk, used as a circular buffer
+    log: MmapMut,
+    /// Notification sink
     sink: Arc<Sink>,
+    /// Network out closure
     write: T,
+    /// Slog logger
     logger: Logger,
 }
-
-declare!(0, PING);
-declare!(1, REPLICATE);
-declare!(2, ACK);
-declare!(3, REBASE);
-declare!(4, UPGRADE);
-declare!(5, PROBE);
-declare!(6, AVAILABLE);
-declare!(7, ADVERTISE);
-declare!(8, VOTE);
-declare!(9, APPEND);
 
 impl<T> FSM<T>
 where
     T: 'static + Send + Fn(&String, Vec<u8>) -> (),
 {
-    const LIVENESS_TIMEOUT: u64 = 3000;
+    const LIVENESS_TIMEOUT: u64 = 1000;
     const ELECTION_TIMEOUT: u64 = 250;
-    const DISKIO_THRESHOLD: u64 = 9;
+ 
+    const SLOT_BYTES: usize = 1024;
+    const RESOLUTION: usize = 128;
+    const CHECKPOINT: usize = 15;
 
     fn count_votes(&self, votes: &mut u64, id: u8) -> (u8, bool) {
 
@@ -294,10 +353,8 @@ where
                 debug_assert!(self.head == 1);
                 debug_assert!(self.tail == 1);
                 debug_assert!(self.commit == 1);
-                self.log.push(LogEntry {
-                    term: 0,
-                    blob: String::new(),
-                });
+                let slot = NULL {};
+                write_slot!(self, slot.to_bytes(0), self.head);
 
                 //
                 // - we start as a FOLLOWER
@@ -492,6 +549,13 @@ where
                     }
                     LEAD(ref ctx) => {
 
+                        for _ in 0..9 {
+                            self.head += 1;
+                            self.age = self.term;
+                            let label = LABEL { text: format!("head #{}", self.head) };
+                            write_slot!(self, label.to_bytes(self.term), self.head);
+                        }
+
                         //
                         // - assert our authority by sending a PING to all our peers
                         // - any peer receiving those will turn into a FOLLOWER if not already
@@ -537,10 +601,8 @@ where
                                         self.tail
                                     );
                                     peer.1.off = self.tail;
-                                    let size = self.head - self.tail + 1;
-                                    for n in 0..size {
-                                        append.push(self.log[n as usize].clone());
-                                    }
+                                    let n = self.head - self.tail + 1;
+                                    read_range!(self, append, self.tail, n);
                                     true
 
                                 } else {
@@ -549,7 +611,6 @@ where
                                     // - we have 1+ log entries to replicate
                                     // - copy entries from [off + 1, head] to the append buffer
                                     //
-                                    let size = self.head - peer.1.off;
                                     pretty!(
                                         self,
                                         "{:?} replicating [#{} .. #{}] to peer #{}",
@@ -558,12 +619,8 @@ where
                                         self.head,
                                         peer.0
                                     );
-                                    for n in 0..size {
-                                        append.push(
-                                            self.log[(peer.1.off + 1 - self.tail + n) as usize]
-                                                .clone(),
-                                        );
-                                    }
+                                    let n = self.head - peer.1.off;
+                                    read_range!(self, append, peer.1.off + 1, n);
                                     false
                                 };
 
@@ -575,22 +632,19 @@ where
                                 // - blank peers will also be able to synch-up this way
                                 // - emit a REPLICATE
                                 //
+                                let slot = read_slot!(self, peer.1.off);
                                 debug_assert!(append.len() > 0);
                                 let msg = REPLICATE {
                                     id: self.id,
                                     term: self.term,
                                     commit: self.commit,
                                     off: peer.1.off,
-                                    age: self.log[(peer.1.off - self.tail) as usize].term,
-                                    append: Vec::new(), //append,
+                                    age: slot.term,
+                                    append,
                                     rebase,
                                 };
 
                                 (self.write)(&peer.1.host, msg.to_raw(&self.host, &peer.1.host));
-
-                                //
-                                // - update the offset for that peer
-                                //
                                 peer.1.off = self.head;
                             }
                         }
@@ -603,96 +657,49 @@ where
                         self.timer.schedule(
                             this.clone(),
                             TIMEOUT(self.seq),
-                            Duration::from_millis(FSM::<T>::LIVENESS_TIMEOUT / 3),
+                            Duration::from_millis(FSM::<T>::LIVENESS_TIMEOUT / 4),
                         );
                     }
                 }
             }
             Opcode::INPUT(STORE(blob)) => {
                 match state {
-                    LEAD(ref _ctx) => {
-
+                    LEAD(ref ctx) => {
+                        
                         //
-                        // - add the entry to our log
+                        // - make sure we have enough room in the log
                         //
-                        self.log.push(LogEntry {
-                            term: self.term,
-                            blob,
-                        });
-
-                        //
-                        // - increment the head offset
-                        // - update the term tracker for the head
-                        // - set the tail offset to #1 upon the first append
-                        //
-                        self.head += 1;
-                        self.age = self.term;
-                        debug_assert!(self.log.len() == (1 + self.head - self.tail) as usize);
-                    }
-                    FLWR(ref ctx) => {
-                        if let Some(id) = ctx.leader {
+                        if self.head - self.tail == FSM::<T>::RESOLUTION as u64 {
+                            pretty!(self, "{:?} discarding blob (log full)", ctx);
+                        } else {
 
                             //
-                            // - if we have a leader redirect the user payload to that peer via
-                            //   a APPEND
+                            // - increment the head offset
+                            // - update the term tracker for the head
+                            // - add the entry to the log
                             //
-                            let peer = &self.peers[&id];
-                            let msg = APPEND {
-                                id: self.id,
+                            self.head += 1;
+                            self.age = self.term;
+                            let slot = SLOT {
+                                code: 255,
                                 term: self.term,
                                 blob,
                             };
-
-                            (self.write)(&peer.host, msg.to_raw(&self.host, &peer.host));
+                            write_slot!(self, serialize(&slot).unwrap(), self.head);
                         }
                     }
                     _ => {}
                 }
             }
             Opcode::INPUT(INCOMING(raw)) => {
-                trace!(&self.logger, "<- {}B from {} (code #{})", raw.msg.len(), raw.src, raw.code);
+                trace!(
+                    &self.logger,
+                    "<- {}B from {} (code #{})",
+                    raw.msg.len(),
+                    raw.src,
+                    raw.code
+                );
                 match raw.code {
-                    APPEND::CODE => {
-                        let mut msg: APPEND = deserialize(&raw.msg[..]).unwrap();
-                        debug_assert!(msg.id != self.id);
-                        if msg.term < self.term {
-
-                            //
-                            // - stale peer: send back a UPGRADE
-                            //
-                            let msg = UPGRADE {
-                                id: self.id,
-                                term: self.term,
-                            };
-                            (self.write)(&raw.src, msg.to_raw(&self.host, &raw.src));
-
-                        } else {
-                            match state {
-                                LEAD(ref _ctx) => {
-
-                                    //
-                                    // - add the entry to our log
-                                    //
-                                    self.log.push(LogEntry {
-                                        term: self.term,
-                                        blob: msg.blob,
-                                    });
-
-                                    //
-                                    // - increment the head offset
-                                    // - update the term tracker for the head
-                                    // - set the tail offset to #1 upon the first append
-                                    //
-                                    self.head += 1;
-                                    self.age = self.term;
-                                    debug_assert!(
-                                        self.log.len() == (1 + self.head - self.tail) as usize
-                                    );
-                                }
-                                _ => {}
-                            }
-                        }
-                    }
                     UPGRADE::CODE => {
                         let msg: UPGRADE = deserialize(&raw.msg[..]).unwrap();
                         debug_assert!(msg.id != self.id);
@@ -746,7 +753,7 @@ where
                                     self.sink.fifo.push(Notification::FOLLOWING);
                                     self.sink.sem.signal();
                                     return FLWR(context::FLWR {
-                                        live: true,
+                                        live: false,
                                         leader: Some(msg.id),
                                     });
                                 }
@@ -766,14 +773,11 @@ where
                                     // - set the live trigger
                                     // - upgrade our term if we are stale
                                     // - make sure we update our leader id if needed
+                                    // - check if we need to update the commit offset
                                     //
                                     ctx.live = true;
                                     self.term = msg.term;
                                     ctx.leader = Some(msg.id);
-
-                                    //
-                                    // -
-                                    //
                                     let next = cmp::min(msg.commit, self.head);
                                     if next > self.commit {
                                         debug_assert!(next >= self.tail);
@@ -786,21 +790,19 @@ where
                                         );
 
                                         //
-                                        // -
+                                        // - if the commit index reached the next checkpoint boundary
+                                        //   reset the tail to that offset
+                                        // - flush the log
+                                        // - notify the sink with a CHECKPOINT
+                                        // - signal the sink event
                                         //
-                                        while self.commit - self.tail >=
-                                            FSM::<T>::DISKIO_THRESHOLD
-                                        {
-
-                                            // snapshot
-
-                                            let mut buf = Vec::new();
-                                            self.tail += FSM::<T>::DISKIO_THRESHOLD;
-                                            buf.extend_from_slice(
-                                                &self.log[FSM::<T>::DISKIO_THRESHOLD as usize..],
-                                            );
-                                            self.log = buf;
-                                            pretty!(self, "{:?} compacted log", ctx);
+                                        let boundary = self.commit - (self.commit % FSM::<T>::CHECKPOINT as u64);
+                                        if boundary > self.tail {
+                                            pretty!(self, "{:?} checkpointed [#{} #{}] ", ctx, self.tail, boundary);
+                                            self.log.flush().unwrap();
+                                            self.sink.fifo.push(Notification::CHECKPOINT(boundary));
+                                            self.sink.sem.signal();
+                                            self.tail = boundary;
                                         }
                                     }
                                 }
@@ -811,22 +813,14 @@ where
                                     // - notify the sink with FOLLOWING
                                     // - increment the sink semaphore
                                     // - upgrade our term and transition to FOLLOWER
-                                    // - note that usualy msg.term is > to our term except in the
-                                    //   case where quorum is 2 (e.g it is possible 2 out of 3
-                                    //   peers vote for each other resulting in both of them
-                                    //   reaching quorum and becoming competing leaders)
-                                    // - this edge case is trivially handled by forcing each LEADER
-                                    //   revert to FOLLOWER
+                                    // - this should be a rare edge case after a partition
                                     //
                                     self.term = msg.term;
-                                    debug_assert!(
-                                        msg.term > self.term || self.peers.len() >> 1 == 1
-                                    );
                                     pretty!(self, "{:?} stepping down", ctx);
                                     self.sink.fifo.push(Notification::FOLLOWING);
                                     self.sink.sem.signal();
                                     return FLWR(context::FLWR {
-                                        live: true,
+                                        live: false,
                                         leader: Some(msg.id),
                                     });
                                 }
@@ -848,6 +842,8 @@ where
                             (self.write)(&raw.src, msg.to_raw(&self.host, &raw.src));
 
                         } else {
+                            let n = (msg.append.len() / FSM::<T>::SLOT_BYTES) as u64;
+                            debug_assert!(n > 0);
                             match state {
                                 FLWR(ref mut ctx) if msg.rebase => {
 
@@ -855,14 +851,19 @@ where
                                     // - reset our log using the append buffer
                                     // - override our tail and head offsets
                                     //
-                                    self.log.clear();
-                                    //self.log.append(&mut msg.append);
                                     self.tail = msg.off;
-                                    self.age = self.log.last().unwrap().term;
-                                    self.head = self.tail + self.log.len() as u64 - 1;
-                                    pretty!(self, "{:?} rebased at offset #{}", ctx, msg.off);
-                                    debug_assert!(
-                                        self.log.len() == (1 + self.head - self.tail) as usize
+                                    self.head = self.tail + n as u64;
+                                    let buf = msg.append;
+                                    write_range!(self, buf, msg.off, n);
+
+                                    let slot = read_slot!(self, self.head);
+                                    self.age = slot.term;
+                                    pretty!(
+                                        self,
+                                        "{:?} rebased into [#{} #{}]",
+                                        ctx,
+                                        self.tail,
+                                        self.head
                                     );
 
                                     //
@@ -892,57 +893,61 @@ where
                                     //   "Reply false if log doesn’t contain an entry at
                                     //    prevLogIndex whose term matches prevLogTerm (§5.3)"
                                     //
-                                    let n = msg.append.len() as u64;
-                                    debug_assert!(n > 0);
+                                    let mut conflict = true;
                                     debug_assert!(msg.off >= self.tail);
-                                    let off = (msg.off - self.tail) as usize;
-                                    if msg.off <= self.head && self.log[off].term == msg.age {
+                                    if msg.off <= self.head {
 
-                                        //
-                                        // - the specified log offset matches
-                                        // - now this offset may not be our head, therefore
-                                        //   truncate() to drop all subsequent entries
-                                        // - then transfer the entries to append at the head
-                                        // - this is conveyed in the original paper as
-                                        //
-                                        //   "If an existing entry conflicts with a new one
-                                        //    (same index but different terms), delete the
-                                        //    existing entry and all that follow it (§5.3)
-                                        //    Append any new entries not already in the log"
-                                        //
-                                        // - force the tail offset to 1 if this is the first
-                                        //   append on this peer
-                                        //
-                                        if self.tail == 0 {
-                                            self.tail = 1;
+                                        let slot = read_slot!(self, msg.off);
+                                        if slot.term == msg.age {
+
+                                            //
+                                            // - the specified log offset matches
+                                            // - now this offset may not be our head, therefore
+                                            //   truncate() to drop all subsequent entries
+                                            // - then transfer the entries to append at the head
+                                            // - this is conveyed in the original paper as
+                                            //
+                                            //   "If an existing entry conflicts with a new one
+                                            //    (same index but different terms), delete the
+                                            //    existing entry and all that follow it (§5.3)
+                                            //    Append any new entries not already in the log"
+                                            //
+
+                                            //
+                                            // - truncate/append at the specified offset
+                                            // - udpate our head offset
+                                            //
+                                            let buf = msg.append;
+                                            write_range!(self, buf, msg.off + 1, n);
+                                            let slot = read_slot!(self, self.head);
+                                            self.head = msg.off + n as u64;
+                                            self.age = slot.term;
+                                            pretty!(
+                                                self,
+                                                "{:?} replicated [#{} #{}]",
+                                                ctx,
+                                                msg.off + 1,
+                                                self.head
+                                            );
+
+                                            //
+                                            // - emit a ACK to acknowledge our new head offset
+                                            //
+                                            let msg = ACK {
+                                                id: self.id,
+                                                term: self.term,
+                                                ack: self.head,
+                                            };
+
+                                            (self.write)(
+                                                &raw.src,
+                                                msg.to_raw(&self.host, &raw.src),
+                                            );
+                                            conflict = false;
                                         }
+                                    }
 
-                                        //
-                                        // - truncate/append at the specified offset
-                                        // - udpate our head offset
-                                        //
-                                        self.log.truncate(off + 1);
-                                        //self.log.append(&mut msg.append);
-                                        debug_assert!(self.log.len() > 0);
-                                        self.age = self.log.last().unwrap().term;
-                                        self.head = self.tail + self.log.len() as u64 - 1;
-                                        debug_assert!(
-                                            self.log.len() == (1 + self.head - self.tail) as usize
-                                        );
-
-                                        //
-                                        // - emit a ACK to acknowledge our new head offset
-                                        //
-                                        let msg = ACK {
-                                            id: self.id,
-                                            term: self.term,
-                                            ack: self.head,
-                                        };
-
-                                        (self.write)(&raw.src, msg.to_raw(&self.host, &raw.src));
-                                        pretty!(self, "{:?} #{} now replicated", ctx, self.head);
-
-                                    } else {
+                                    if conflict {
 
                                         //
                                         // - we can't validate the proposed check mark
@@ -1052,10 +1057,11 @@ where
                                         //
                                         debug_assert!(smallest >= self.tail);
                                         for n in self.commit..smallest {
+                                            let slot = read_slot!(self, n);
                                             self.sink.fifo.push(Notification::COMMIT(
-                                                self.log[(n - self.tail) as usize]
-                                                    .blob
-                                                    .clone(),
+                                                n,
+                                                slot.code,
+                                                slot.blob,
                                             ));
                                             self.sink.sem.signal();
                                         }
@@ -1063,21 +1069,19 @@ where
                                         pretty!(self, "{:?} offset #{} committed", ctx, smallest);
 
                                         //
-                                        // -
+                                        // - if the commit index reached the next checkpoint boundary
+                                        //   reset the tail to that offset
+                                        // - flush the log
+                                        // - notify the sink with a CHECKPOINT
+                                        // - signal the sink event
                                         //
-                                        while self.commit - self.tail >=
-                                            FSM::<T>::DISKIO_THRESHOLD
-                                        {
-
-                                            // snapshot
-
-                                            let mut buf = Vec::new();
-                                            self.tail += FSM::<T>::DISKIO_THRESHOLD;
-                                            buf.extend_from_slice(
-                                                &self.log[FSM::<T>::DISKIO_THRESHOLD as usize..],
-                                            );
-                                            self.log = buf;
-                                            pretty!(self, "{:?} compacted log", ctx);
+                                        let boundary = self.commit - (self.commit % FSM::<T>::CHECKPOINT as u64);
+                                        if boundary > self.tail {
+                                            pretty!(self, "{:?} checkpointed [#{} #{}] ", ctx, self.tail, boundary);
+                                            self.log.flush().unwrap();
+                                            self.sink.fifo.push(Notification::CHECKPOINT(boundary));
+                                            self.sink.sem.signal();
+                                            self.tail = boundary;
                                         }
                                     }
                                 }
@@ -1306,10 +1310,12 @@ where
             Opcode::EXIT => {
 
                 //
+                // - flush the log file
                 // - send a last notification to our sink
                 // - disable the sink semaphore which will force the consuming thread to pop
                 //   all pending notifications and then move on
                 //
+                self.log.flush().unwrap();
                 self.sink.fifo.push(Notification::EXIT);
                 self.sink.sem.disable();
             }
@@ -1357,6 +1363,15 @@ impl Protocol {
         // -
         //
         let sink = Arc::new(Sink::new());
+        let path = PathBuf::from(format!("log.{}", id));
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .open(&path)
+            .unwrap();
+        let off = FSM::<T>::RESOLUTION * FSM::<T>::SLOT_BYTES;
+        file.set_len(off as u64).unwrap();
         let fsm = Automaton::spawn(
             guard.clone(),
             Box::new(FSM {
@@ -1370,7 +1385,7 @@ impl Protocol {
                 commit: 1,
                 peers,
                 timer: Timer::spawn(guard.clone()),
-                log: Vec::new(),
+                log: unsafe { MmapMut::map_mut(&file).unwrap() },
                 sink: sink.clone(),
                 write,
                 logger,
@@ -1402,7 +1417,7 @@ impl Protocol {
     }
 
     #[allow(dead_code)]
-    pub fn store(&self, blob: String) -> () {
+    pub fn store(&self, blob: Vec<u8>) -> () {
         let _ = self.fsm.post(STORE(blob));
     }
 }
@@ -1426,7 +1441,8 @@ pub enum Notification {
     FOLLOWING,
     LEADING,
     IDLE,
-    COMMIT(String),
+    COMMIT(u64, u8, Vec<u8>),
+    CHECKPOINT(u64),
     EXIT,
 }
 
