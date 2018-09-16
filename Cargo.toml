@@ -30,3 +30,6 @@ path = "src/lib.rs"
 [[bin]]
 name = "cluster"
 path = "src/bin/cluster.rs"
+
+[features]
+chaos = []

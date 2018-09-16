@@ -15,24 +15,39 @@
 //!                                <---------------+
 //! ```
 //!
+//!  # Payload
+//!
 //!  # Capacity
 //!
 //!   This implementation offers the following properties:
-//!     - most of the raft spec supported
-//!     - all offsets on 64 bits
+//!     - log backed up by a circular buffer on disk
+//!     - most of the raft spec is supported
 //!     - up to 64 peers in one cluster
-//!     - maximum log capacity up to whatever the backing file is
-//!     - periodic checkpointing
+//!     - all offsets are on 64 bits
+//!     - maximum peer lag up to whatever the underlying file is
+//!     - periodic checkpointing when enough commits went by
 //!     - I/O between peers uses byte buffers encoded using bincode
 //!     - pre-vote phase prior to triggering an election
 //!
 //!  # Log implementation
 //!
+//!   The log is append only and is backed up by a circular buffer on disk. This means the lag
+//!   between the head and tail offsets is bounded (e.g peers cannot lag forever). Writes are
+//!   skipped upon reaching maximum capacity and until one or more commits happen.
+//!
+//!   Each slot has a fixed maximum byte size and contains its term plus a free form user payload
+//!   as a raw byte array. The slot is encoded using bincode.
+//!
+//!   The automaton maintains a variable log window tracked by a head and tail offsets. The
+//!   commit offset is always located in that window. This window is checkpointed whenever the
+//!   distance between the commit and tail offsets reaches a predefined boundary. The tail offset
+//!   will therefore always be a multiple of this threshold.
+//!
 //! ```ignore
 //!
 //!          boundary #n                           boundary #n+1
 //!
-//!              |<-       compaction window #n       ->|
+//!              |<-       checkpointing window #n       ->|
 //!              +-------------------------------------------------+---------------> offsets
 //!             tail                   |                          head
 //!                                  commit
@@ -41,17 +56,9 @@
 //!  # Impementation notes
 //!
 //!   * Instead of initializing the offsets to 0 we force a dummy entry at #1 to simply the code.
-//!   * The log itself is backed by a circular buffer on disk that is memory mapped. Each slot has
-//!     a fixed maximum byte size and contains its term plus a free form user payload as a raw
-//!     byte array. The slot is encoded using bincode.
-//!   * The log has a maximum capacity that cannot be exceeded.
 //!   * The original raft protocol has been slightly changed around compaction and how we handle
 //!     conflicts. This implementation is simpler in the sense we always force a peer rebase at
-//!     the last compaction boundary.
-//!   * The automaton maintains a variable log window tracked by a head and tail offsets. The
-//!     commit offset is always located in that window. This window is compacted whenever the
-//!     distance between the commit and tail offsets reaches a predefined threshold. The tail
-//!     offset will therefore always be a multiple of this threshold.
+//!     the last checkpointing boundary.
 //!
 //!  # Ideas
 //!
@@ -65,12 +72,12 @@
 //!   * [Optimizations.](http://openlife.cc/system/files/3-modifications-for-Raft-consensus.pdf)
 use bincode::{serialize, deserialize};
 use fsm::automaton::{Automaton, Opcode, Recv};
-use fsm::mpsc::MPSC;
 use fsm::timer::Timer;
 use memmap::MmapMut;
 use primitives::event::*;
-use primitives::semaphore::*;
+use primitives::rwlock::*;
 use raft::messages::*;
+use raft::sink::*;
 use raft::slots::*;
 use rand::{Rng, thread_rng};
 use self::Command::*;
@@ -82,6 +89,8 @@ use std::fmt;
 use std::fs::OpenOptions;
 use std::path::PathBuf;
 use std::sync::Arc;
+#[cfg(feature = "chaos")]
+use std::thread;
 use std::time::Duration;
 
 macro_rules! pretty {
@@ -90,13 +99,13 @@ macro_rules! pretty {
             "term" => $self.term,
             "head" => $self.head,
             "tail" => $self.tail,
-            "commit" => $self.commit);
+            "cmit" => $self.commit);
     };
 }
 
 macro_rules! disk {
     ($off:expr) => {
-        (($off - 1) as usize % FSM::<T>::RESOLUTION) * FSM::<T>::SLOT_BYTES
+        (($off - 1) as usize % FSM::<S, T, U>::RESOLUTION) * FSM::<S, T, U>::SLOT_BYTES
     };
 }
 
@@ -104,7 +113,8 @@ macro_rules! read_slot {
     ($self:ident, $off:expr) => {
         {
             let off = disk!($off);
-            let slot: SLOT = deserialize(&$self.log[off..off + FSM::<T>::SLOT_BYTES]).unwrap();
+            let slot: SLOT =
+                deserialize(&$self.log[off..off + FSM::<S, T, U>::SLOT_BYTES]).unwrap();
             slot
         }
     };
@@ -125,11 +135,6 @@ macro_rules! read_range {
             let start = disk!($off);
             let end = disk!($off + $n);
             if end < start {
-
-                //
-                // - we wrapped around the circular buffer
-                // - break the copy in 2 chunks
-                //
                 $buf.extend_from_slice(&$self.log[start..]);
                 $buf.extend_from_slice(&$self.log[..end]);
             } else {
@@ -145,12 +150,7 @@ macro_rules! write_range {
             let start = disk!($off);
             let end = disk!($off + $n);
             if end < start {
-                
-                //
-                // - we wrapped around the circular buffer
-                // - break the copy in 2 chunks
-                //
-                let cut = FSM::<T>::RESOLUTION * FSM::<T>::SLOT_BYTES - start;
+                let cut = FSM::<S, T, U>::RESOLUTION * FSM::<S, T, U>::SLOT_BYTES - start;
                 $self.log[start..].copy_from_slice(&$buf[..cut]);
                 $self.log[..end].copy_from_slice(&$buf[cut..]);
             } else {
@@ -203,11 +203,10 @@ mod context {
     }
 }
 
-pub enum Command {
-    INCOMING(RAW),
+enum Command {
+    BYTES(RAW),
     STORE(Vec<u8>),
     TIMEOUT(u64),
-    HEARTBEAT,
 }
 
 #[derive(Copy, Clone)]
@@ -263,14 +262,19 @@ struct Peer {
     ack: u64,
 }
 
+pub trait Payload {
+    fn flush(&self) -> Vec<u8>;
+}
+
 ///  todo items:
-///    o) snapshotting
 ///    o) membership add()/remove()
 ///    o) the latest vote must be persisted (e.g persist an empty _NO_VOTE file under /tmp for a
 ///       given term and erase it as soon as we're not candidate anymore ?)
-struct FSM<T>
+struct FSM<S, T, U>
 where
-    T: 'static + Send + Fn(&String, Vec<u8>) -> (),
+    S: 'static + Send + Default + Payload,
+    T: 'static + Send + Fn(&str, &[u8]) -> (),
+    U: 'static + Send + Fn(&mut S, &[u8]) -> (),
 {
     /// Local peer index in [0, 64].
     id: u8,
@@ -290,25 +294,37 @@ where
     commit: u64,
     /// Map of peer id <-> host + offsets
     peers: HashMap<u8, Peer>,
-    /// Internal timer automaton
+    /// Internal timer automaton used to enforce timeouts
     timer: Timer<Command>,
     /// Memory mapped log file on disk, used as a circular buffer
     log: MmapMut,
     /// Notification sink
     sink: Arc<Sink>,
+    /// Payload updated upon commit, used for checkpointing
+    payload: Arc<RWLock<S>>,
     /// Network out closure
     write: T,
+    /// User payload update closure
+    apply: U,
     /// Slog logger
     logger: Logger,
 }
 
-impl<T> FSM<T>
+impl<S, T, U> FSM<S, T, U>
 where
-    T: 'static + Send + Fn(&String, Vec<u8>) -> (),
+    S: 'static + Send + Default + Payload,
+    T: 'static + Send + Fn(&str, &[u8]) -> (),
+    U: 'static + Send + Fn(&mut S, &[u8]) -> (),
 {
+    //
+    // - various timeouts in milliseconds
+    //
     const LIVENESS_TIMEOUT: u64 = 1000;
     const ELECTION_TIMEOUT: u64 = 250;
- 
+
+    //
+    // - log topology (slot width, etc.)
+    //
     const SLOT_BYTES: usize = 1024;
     const RESOLUTION: usize = 128;
     const CHECKPOINT: usize = 15;
@@ -332,9 +348,11 @@ where
     }
 }
 
-impl<T> Recv<Command, State> for FSM<T>
+impl<S, T, U> Recv<Command, State> for FSM<S, T, U>
 where
-    T: Send + Fn(&String, Vec<u8>) -> (),
+    S: 'static + Send + Default + Payload,
+    T: 'static + Send + Fn(&str, &[u8]) -> (),
+    U: 'static + Send + Fn(&mut S, &[u8]) -> (),
 {
     fn recv(
         &mut self,
@@ -363,7 +381,7 @@ where
                 self.timer.schedule(
                     this.clone(),
                     TIMEOUT(self.seq),
-                    Duration::from_millis(FSM::<T>::LIVENESS_TIMEOUT),
+                    Duration::from_millis(FSM::<S, T, U>::LIVENESS_TIMEOUT),
                 );
             }
             Opcode::TRANSITION(prv) => {
@@ -432,7 +450,7 @@ where
                         self.timer.schedule(
                             this.clone(),
                             TIMEOUT(self.seq),
-                            Duration::from_millis(FSM::<T>::LIVENESS_TIMEOUT),
+                            Duration::from_millis(FSM::<S, T, U>::LIVENESS_TIMEOUT),
                         );
                     }
                     _ => {
@@ -461,10 +479,8 @@ where
                                 head: self.head,
                                 age: self.age,
                             };
-                            (self.write)(
-                                &peer.1.host.clone(),
-                                msg.to_raw(&self.host, &peer.1.host),
-                            );
+                            let bytes = msg.to_raw(&self.host, &peer.1.host);
+                            (self.write)(&peer.1.host.clone(), &bytes);
                         }
 
                         //
@@ -475,7 +491,7 @@ where
                         self.timer.schedule(
                             this.clone(),
                             TIMEOUT(self.seq),
-                            Duration::from_millis(FSM::<T>::ELECTION_TIMEOUT),
+                            Duration::from_millis(FSM::<S, T, U>::ELECTION_TIMEOUT),
                         );
                     }
                     CNDT(ref mut ctx) => {
@@ -504,7 +520,8 @@ where
                                 head: self.head,
                                 age: self.age,
                             };
-                            (self.write)(&peer.1.host, msg.to_raw(&self.host, &peer.1.host));
+                            let bytes = msg.to_raw(&self.host, &peer.1.host);
+                            (self.write)(&peer.1.host, &bytes);
                         }
 
                         //
@@ -515,7 +532,7 @@ where
                         self.timer.schedule(
                             this.clone(),
                             TIMEOUT(self.seq),
-                            Duration::from_millis(FSM::<T>::ELECTION_TIMEOUT),
+                            Duration::from_millis(FSM::<S, T, U>::ELECTION_TIMEOUT),
                         );
                     }
                     FLWR(ref mut ctx) => {
@@ -530,7 +547,7 @@ where
                             self.timer.schedule(
                                 this.clone(),
                                 TIMEOUT(self.seq),
-                                Duration::from_millis(FSM::<T>::LIVENESS_TIMEOUT),
+                                Duration::from_millis(FSM::<S, T, U>::LIVENESS_TIMEOUT),
                             );
 
                         } else {
@@ -570,7 +587,8 @@ where
                                 term: self.term,
                                 commit: self.commit,
                             };
-                            (self.write)(&peer.1.host, msg.to_raw(&self.host, &peer.1.host));
+                            let bytes = msg.to_raw(&self.host, &peer.1.host);
+                            (self.write)(&peer.1.host, &bytes);
                             debug_assert!(peer.1.off <= self.head);
                             if self.head > peer.1.off {
 
@@ -644,7 +662,8 @@ where
                                     rebase,
                                 };
 
-                                (self.write)(&peer.1.host, msg.to_raw(&self.host, &peer.1.host));
+                                let bytes = msg.to_raw(&self.host, &peer.1.host);
+                                (self.write)(&peer.1.host, &bytes);
                                 peer.1.off = self.head;
                             }
                         }
@@ -657,7 +676,7 @@ where
                         self.timer.schedule(
                             this.clone(),
                             TIMEOUT(self.seq),
-                            Duration::from_millis(FSM::<T>::LIVENESS_TIMEOUT / 4),
+                            Duration::from_millis(FSM::<S, T, U>::LIVENESS_TIMEOUT / 4),
                         );
                     }
                 }
@@ -665,11 +684,11 @@ where
             Opcode::INPUT(STORE(blob)) => {
                 match state {
                     LEAD(ref ctx) => {
-                        
+
                         //
                         // - make sure we have enough room in the log
                         //
-                        if self.head - self.tail == FSM::<T>::RESOLUTION as u64 {
+                        if self.head - self.tail == FSM::<S, T, U>::RESOLUTION as u64 {
                             pretty!(self, "{:?} discarding blob (log full)", ctx);
                         } else {
 
@@ -691,7 +710,18 @@ where
                     _ => {}
                 }
             }
-            Opcode::INPUT(INCOMING(raw)) => {
+            Opcode::INPUT(BYTES(raw)) => {
+                #[cfg(feature = "chaos")]
+                {
+                    //
+                    // - if the chaos feature is enabled randomly slow
+                    //
+                    let mut rng = thread_rng();
+                    if rng.gen_range(0, 100) > 50 {
+                        let ms = rng.gen_range(0, 500);
+                        thread::sleep(Duration::from_millis(ms));
+                    }
+                }
                 trace!(
                     &self.logger,
                     "<- {}B from {} (code #{})",
@@ -736,7 +766,8 @@ where
                                 id: self.id,
                                 term: self.term,
                             };
-                            (self.write)(&raw.src, msg.to_raw(&self.host, &raw.src));
+                            let bytes = msg.to_raw(&self.host, &raw.src);
+                            (self.write)(&raw.src, &bytes);
 
                         } else {
                             match state {
@@ -781,6 +812,12 @@ where
                                     let next = cmp::min(msg.commit, self.head);
                                     if next > self.commit {
                                         debug_assert!(next >= self.tail);
+                                        let mut guard = self.payload.write();
+                                        for n in self.commit..next {
+                                            let slot = read_slot!(self, n);
+                                            (self.apply)(&mut guard.val, &slot.blob);
+                                        }
+                                        drop(guard);
                                         self.commit = next;
                                         pretty!(
                                             self,
@@ -790,15 +827,24 @@ where
                                         );
 
                                         //
-                                        // - if the commit index reached the next checkpoint boundary
+                                        // - if the commit index reached a checkpoint boundary
                                         //   reset the tail to that offset
                                         // - flush the log
                                         // - notify the sink with a CHECKPOINT
                                         // - signal the sink event
                                         //
-                                        let boundary = self.commit - (self.commit % FSM::<T>::CHECKPOINT as u64);
+                                        let boundary = self.commit -
+                                            (self.commit % FSM::<S, T, U>::CHECKPOINT as u64);
                                         if boundary > self.tail {
-                                            pretty!(self, "{:?} checkpointed [#{} #{}] ", ctx, self.tail, boundary);
+                                            pretty!(
+                                                self,
+                                                "{:?} checkpointed [#{} #{}] ",
+                                                ctx,
+                                                self.tail,
+                                                boundary
+                                            );
+                                            // serialize the payload
+                                            //let _ = self.payload.flush();
                                             self.log.flush().unwrap();
                                             self.sink.fifo.push(Notification::CHECKPOINT(boundary));
                                             self.sink.sem.signal();
@@ -839,10 +885,11 @@ where
                                 id: self.id,
                                 term: self.term,
                             };
-                            (self.write)(&raw.src, msg.to_raw(&self.host, &raw.src));
+                            let bytes = msg.to_raw(&self.host, &raw.src);
+                            (self.write)(&raw.src, &bytes);
 
                         } else {
-                            let n = (msg.append.len() / FSM::<T>::SLOT_BYTES) as u64;
+                            let n = (msg.append.len() / FSM::<S, T, U>::SLOT_BYTES) as u64;
                             debug_assert!(n > 0);
                             match state {
                                 FLWR(ref mut ctx) if msg.rebase => {
@@ -875,7 +922,8 @@ where
                                         ack: self.head,
                                     };
 
-                                    (self.write)(&raw.src, msg.to_raw(&self.host, &raw.src));
+                                    let bytes = msg.to_raw(&self.host, &raw.src);
+                                    (self.write)(&raw.src, &bytes);
                                 }
                                 FLWR(ref mut ctx) => {
 
@@ -912,8 +960,6 @@ where
                                             //    existing entry and all that follow it (§5.3)
                                             //    Append any new entries not already in the log"
                                             //
-
-                                            //
                                             // - truncate/append at the specified offset
                                             // - udpate our head offset
                                             //
@@ -939,10 +985,8 @@ where
                                                 ack: self.head,
                                             };
 
-                                            (self.write)(
-                                                &raw.src,
-                                                msg.to_raw(&self.host, &raw.src),
-                                            );
+                                            let bytes = msg.to_raw(&self.host, &raw.src);
+                                            (self.write)(&raw.src, &bytes);
                                             conflict = false;
                                         }
                                     }
@@ -971,7 +1015,8 @@ where
                                             term: self.term,
                                         };
 
-                                        (self.write)(&raw.src, msg.to_raw(&self.host, &raw.src));
+                                        let bytes = msg.to_raw(&self.host, &raw.src);
+                                        (self.write)(&raw.src, &bytes);
                                     }
                                 }
                                 _ => {}
@@ -990,7 +1035,8 @@ where
                                 id: self.id,
                                 term: self.term,
                             };
-                            (self.write)(&raw.src, msg.to_raw(&self.host, &raw.src));
+                            let bytes = msg.to_raw(&self.host, &raw.src);
+                            (self.write)(&raw.src, &bytes);
 
                         } else {
                             match state {
@@ -1056,28 +1102,34 @@ where
                                         // - signal the sink event
                                         //
                                         debug_assert!(smallest >= self.tail);
+                                        let mut guard = self.payload.write();
                                         for n in self.commit..smallest {
                                             let slot = read_slot!(self, n);
-                                            self.sink.fifo.push(Notification::COMMIT(
-                                                n,
-                                                slot.code,
-                                                slot.blob,
-                                            ));
+                                            (self.apply)(&mut guard.val, &slot.blob);
+                                            self.sink.fifo.push(Notification::COMMIT(n, slot.blob));
                                             self.sink.sem.signal();
                                         }
+                                        drop(guard);
                                         self.commit = smallest;
                                         pretty!(self, "{:?} offset #{} committed", ctx, smallest);
 
                                         //
-                                        // - if the commit index reached the next checkpoint boundary
-                                        //   reset the tail to that offset
+                                        // - if the commit index reached a checkpoint boundary
+                                        // - reset the tail to that offset
                                         // - flush the log
                                         // - notify the sink with a CHECKPOINT
                                         // - signal the sink event
                                         //
-                                        let boundary = self.commit - (self.commit % FSM::<T>::CHECKPOINT as u64);
+                                        let boundary = self.commit -
+                                            (self.commit % FSM::<S, T, U>::CHECKPOINT as u64);
                                         if boundary > self.tail {
-                                            pretty!(self, "{:?} checkpointed [#{} #{}] ", ctx, self.tail, boundary);
+                                            pretty!(
+                                                self,
+                                                "{:?} checkpointed [#{} #{}] ",
+                                                ctx,
+                                                self.tail,
+                                                boundary
+                                            );
                                             self.log.flush().unwrap();
                                             self.sink.fifo.push(Notification::CHECKPOINT(boundary));
                                             self.sink.sem.signal();
@@ -1101,7 +1153,8 @@ where
                                 id: self.id,
                                 term: self.term,
                             };
-                            (self.write)(&raw.src, msg.to_raw(&self.host, &raw.src));
+                            let bytes = msg.to_raw(&self.host, &raw.src);
+                            (self.write)(&raw.src, &bytes);
 
                         } else {
                             match state {
@@ -1132,7 +1185,8 @@ where
                                 id: self.id,
                                 term: self.term,
                             };
-                            (self.write)(&raw.src, msg.to_raw(&self.host, &raw.src));
+                            let bytes = msg.to_raw(&self.host, &raw.src);
+                            (self.write)(&raw.src, &bytes);
 
                         } else {
                             match state {
@@ -1150,7 +1204,8 @@ where
                                             id: self.id,
                                             term: self.term,
                                         };
-                                        (self.write)(&raw.src, msg.to_raw(&self.host, &raw.src));
+                                        let bytes = msg.to_raw(&self.host, &raw.src);
+                                        (self.write)(&raw.src, &bytes);
                                     }
                                 }
                                 _ => {}
@@ -1169,7 +1224,8 @@ where
                                 id: self.id,
                                 term: self.term,
                             };
-                            (self.write)(&raw.src, msg.to_raw(&self.host, &raw.src));
+                            let bytes = msg.to_raw(&self.host, &raw.src);
+                            (self.write)(&raw.src, &bytes);
                         } else {
                             match state {
                                 PREV(ref mut ctx) => {
@@ -1211,7 +1267,8 @@ where
                                 id: self.id,
                                 term: self.term,
                             };
-                            (self.write)(&raw.src, msg.to_raw(&self.host, &raw.src));
+                            let bytes = msg.to_raw(&self.host, &raw.src);
+                            (self.write)(&raw.src, &bytes);
                         } else {
                             match state {
                                 CNDT(ref mut ctx) |
@@ -1253,7 +1310,8 @@ where
                                             term: self.term,
                                         };
 
-                                        (self.write)(&raw.src, msg.to_raw(&self.host, &raw.src));
+                                        let bytes = msg.to_raw(&self.host, &raw.src);
+                                        (self.write)(&raw.src, &bytes);
                                     }
                                 }
                                 _ => {}
@@ -1272,7 +1330,8 @@ where
                                 id: self.id,
                                 term: self.term,
                             };
-                            (self.write)(&raw.src, msg.to_raw(&self.host, &raw.src));
+                            let bytes = msg.to_raw(&self.host, &raw.src);
+                            (self.write)(&raw.src, &bytes);
                         } else {
                             match state {
                                 CNDT(ref mut ctx) => {
@@ -1326,16 +1385,22 @@ where
 }
 
 impl Protocol {
-    pub fn spawn<T>(
+    /// Constructor method to spawn a new raft automaton. The automaton is defined by a unique u8
+    /// identifier and a network destination (e.g host+port). An optional set of seed peers may be
+    /// specified.
+    pub fn spawn<S, T, U>(
         guard: Arc<Guard>,
         id: u8,
         host: String,
         seeds: Option<HashMap<u8, String>>,
         write: T,
+        apply: U,
         logger: Logger,
-    ) -> (Self, Arc<Sink>)
+    ) -> (Self, Arc<ROLock<S>>, Arc<Sink>)
     where
-        T: 'static + Send + Fn(&String, Vec<u8>) -> (),
+        S: 'static + Send + Default + Payload,
+        T: 'static + Send + Fn(&str, &[u8]) -> (),
+        U: 'static + Send + Fn(&mut S, &[u8]) -> (),
     {
         //
         // - turn the specified id/host mapping into our peer map
@@ -1360,9 +1425,9 @@ impl Protocol {
         };
 
         //
-        // -
+        // - setup the log file
+        // - size it
         //
-        let sink = Arc::new(Sink::new());
         let path = PathBuf::from(format!("log.{}", id));
         let file = OpenOptions::new()
             .read(true)
@@ -1370,8 +1435,18 @@ impl Protocol {
             .create(true)
             .open(&path)
             .unwrap();
-        let off = FSM::<T>::RESOLUTION * FSM::<T>::SLOT_BYTES;
+        let off = FSM::<S, T, U>::RESOLUTION * FSM::<S, T, U>::SLOT_BYTES;
         file.set_len(off as u64).unwrap();
+
+        //
+        // - create a notification sink
+        // - default the payload and wrap it in a RWLock
+        // - obtain a ROLock from it
+        // - start the automaton proper
+        //
+        let sink = Arc::new(Sink::new());
+        let payload = Arc::new(RWLock::from(Default::default()));
+        let lock = Arc::new(payload.read_only());
         let fsm = Automaton::spawn(
             guard.clone(),
             Box::new(FSM {
@@ -1387,12 +1462,14 @@ impl Protocol {
                 timer: Timer::spawn(guard.clone()),
                 log: unsafe { MmapMut::map_mut(&file).unwrap() },
                 sink: sink.clone(),
+                payload,
                 write,
+                apply,
                 logger,
             }),
         );
 
-        (Protocol { fsm }, sink)
+        (Protocol { fsm }, lock, sink)
     }
 
     #[allow(dead_code)]
@@ -1401,7 +1478,7 @@ impl Protocol {
     }
 
     #[allow(dead_code)]
-    pub fn feed(&self, bytes: Vec<u8>) -> () {
+    pub fn feed(&self, bytes: &[u8]) -> () {
 
         //
         // - unpack the incoming byte stream
@@ -1410,7 +1487,7 @@ impl Protocol {
         //
         match deserialize(&bytes[..]) {
             Ok(raw) => {
-                let _ = self.fsm.post(INCOMING(raw));
+                let _ = self.fsm.post(BYTES(raw));
             }
             _ => {}
         }
@@ -1431,45 +1508,5 @@ impl Clone for Protocol {
 impl Drop for Protocol {
     fn drop(&mut self) -> () {
         self.fsm.drain();
-    }
-}
-
-/// Events emitted by the state machine. Those are available for the user to react
-/// to membership changes, commits, etc.
-#[derive(Debug)]
-pub enum Notification {
-    FOLLOWING,
-    LEADING,
-    IDLE,
-    COMMIT(u64, u8, Vec<u8>),
-    CHECKPOINT(u64),
-    EXIT,
-}
-
-/// Simple blocking notification sink consuming from a MPSC. Once signaled with no
-/// content the sink will disable itself and always fail.
-pub struct Sink {
-    sem: Semaphore,
-    fifo: MPSC<Notification>,
-}
-
-impl Sink {
-    #[allow(dead_code)]
-    pub fn next(&self) -> Option<Notification> {
-
-        //
-        // - wait/pop, this will fast-fail on None as soon as we disable the semaphore, e.g
-        //   when the state-machine exits
-        //
-        self.sem.wait();
-        self.fifo.pop().ok()
-    }
-
-    fn new() -> Self {
-
-        Sink {
-            sem: Semaphore::new(),
-            fifo: MPSC::new(),
-        }
     }
 }

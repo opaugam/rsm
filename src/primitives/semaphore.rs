@@ -97,7 +97,7 @@ impl Semaphore {
         // - otehrwise run a CAS loop to set it
         //
         let mut cur = self.tag.load(Ordering::Relaxed);
-        if cur & DEAD > 0 { 
+        if cur & DEAD > 0 {
             return;
         }
 

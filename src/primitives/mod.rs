@@ -8,6 +8,7 @@ pub mod event;
 pub mod gate;
 pub mod lock;
 pub mod once;
+pub mod rwlock;
 pub mod semaphore;
 
 const CNT_MSK: usize = 0xFFFF_FF00;
@@ -244,6 +245,7 @@ mod tests {
     use primitives::lock::*;
     use primitives::once::*;
     use primitives::tests::rand::{Rng, thread_rng};
+    use primitives::rwlock::*;
     use std::sync::Arc;
     use std::sync::atomic::spin_loop_hint;
     use std::thread;

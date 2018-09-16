@@ -5,17 +5,20 @@ extern crate clap;
 extern crate ctrlc;
 extern crate rsm;
 #[macro_use]
+extern crate serde_derive;
+#[macro_use]
 extern crate slog;
 extern crate slog_async;
 extern crate slog_term;
 
-use bincode::deserialize;
+use bincode::{deserialize, serialize};
 use rsm::primitives::event::*;
-use rsm::raft::slots::LABEL;
-use rsm::raft::protocol::{Notification, Protocol};
+use rsm::raft::protocol::{Payload, Protocol};
+use rsm::raft::sink::*;
 use slog::{Drain, Level, LevelFilter, Logger};
 use slog_term::{FullFormat, PlainSyncDecorator};
 use slog_async::Async;
+use std::cmp;
 use std::collections::HashMap;
 use std::env;
 use std::path::Path;
@@ -63,10 +66,10 @@ fn main() {
     let guard = event.guard();
 
     //
-    // - start a few raft automata
-    // - loop and consume notifications for each
+    // - start a few raft automata using the --size CLI argument
+    // - cap to 16
     //
-    let size = value_t!(args, "SIZE", u8).unwrap_or(3);
+    let size = cmp::min(value_t!(args, "SIZE", u8).unwrap_or(3), 16);
     let peers = Arc::new(Mutex::new(HashMap::<String, Protocol>::new()));
     for n in 0..size {
 
@@ -79,26 +82,57 @@ fn main() {
         let _ = thread::spawn(move || {
 
             //
-            // -
+            // - prep a mock configuration with n peers
+            // - this is similar to the zookeeper configuration
+            // - instead of a host:port our network destination is a simple label
             //
             let seeds : HashMap<_, _> = (0..size).map(|n| (n, format!("#{}", n))).collect();
 
             //
-            // - start a new automata and grab its notification sink
+            // - define our payload, e.g the stateful information to which each commit
+            //   will be applied to by the automaton
+            //
+            #[derive(Debug, Default, Serialize, Deserialize)]
+            struct COUNTER {
+
+                count: u64,
+            }
+
+            impl Payload for COUNTER {
+                fn flush(&self) -> Vec<u8> {
+                    serialize(&self).unwrap()
+                }
+            }
+
+            //
+            // - start a new automata
+            // - retrieve a read lock on the payload plus a notification sink
             //
             let id = format!("#{}", n);
-            let (raft, sink) = {
+            let (raft, lock, sink) = {
                 let guard = guard.clone();
                 let shared = shared.clone();
-                Protocol::spawn(
+                Protocol::spawn::<COUNTER,_,_>(
                     guard,
                     n,
                     seeds[&n].clone(),
                     Some(seeds),
                     move |host, bytes| {
+
+                        //
+                        // - find the destination automaton in our map
+                        // - post the opaque byte buffer
+                        //
                         let peers = shared.lock().unwrap();
                         let raft = &peers[host];
                         raft.feed(bytes);
+                    },
+                    |payload, _| {
+
+                        //
+                        // - increment the payload upon each commit
+                        //
+                        payload.count += 1;
                     },
                     log.0,
                 )
@@ -120,18 +154,15 @@ fn main() {
             loop {
                 match sink.next() {
                     None => break,
-                    Some(Notification::COMMIT(off, code, bytes)) => {
-                        match code {
-                            LABEL::CODE => {
-                                let label: LABEL = deserialize(&bytes).unwrap();
-                                info!(&log.1, "commit #{} : {:?}", off, label.text);
-                            }
-                            _ => {}
-                        }
+                    Some(Notification::CHECKPOINT(_)) => {
+
+                        //
+                        // -
+                        //
+                        let guard = lock.read();
+                        info!(&log.1, "{:?}", guard.val);
                     }
-                    Some(notif) => {
-                        info!(&log.1, "> {:?}", notif);
-                    }
+                    _ => {}
                 }
             }
 
