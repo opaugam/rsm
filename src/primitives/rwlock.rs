@@ -45,8 +45,9 @@ impl<'a, T> Deref for ReadGuard<'a, T> {
     fn deref(&self) -> &T {
         if let Some(ref val) = self.inner {
             &*val
+        } else {
+            unreachable!()
         }
-        else { unreachable!() }
     }
 }
 
@@ -82,18 +83,19 @@ impl<'a, T> Deref for WriteGuard<'a, T> {
     fn deref(&self) -> &T {
         if let Some(ref val) = self.inner {
             &*val
+        } else {
+            unreachable!()
         }
-        else { unreachable!() }
     }
 }
 
 impl<'a, T> DerefMut for WriteGuard<'a, T> {
-
     fn deref_mut(&mut self) -> &mut T {
         if let Some(ref mut val) = self.inner {
             &mut *val
+        } else {
+            panic!();
         }
-        else { panic!(); }
     }
 }
 

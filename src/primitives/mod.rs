@@ -298,7 +298,7 @@ mod tests {
                 let lock = lock.clone();
                 let guard = guard.clone();
                 let _ = thread::spawn(move || {
-                    
+
                     let val = lock.read();
                     assert!(lock.readers() > 0);
                     assert!(*val >= 0);

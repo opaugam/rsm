@@ -17,17 +17,23 @@
 //!
 //!  # Payload
 //!
+//!  The automaton maintains some arbitrary user payload and updates it on every commit. Whenever
+//!  the commit offset reaches a new checkpointing window (e.g a fixed number of commits) the
+//!  current payload is serialized into a byte buffer. This buffer is transmitted to any peer
+//!  that needs to be rebased (e.g lags). Please note a read-only lock is passed back to the user
+//!  to access the payload at any time.
+//!
 //!  # Capacity
 //!
 //!   This implementation offers the following properties:
-//!     - log backed up by a circular buffer on disk
-//!     - most of the raft spec is supported
-//!     - up to 64 peers in one cluster
-//!     - all offsets are on 64 bits
-//!     - maximum peer lag up to whatever the underlying file is
-//!     - periodic checkpointing when enough commits went by
-//!     - I/O between peers uses byte buffers encoded using bincode
-//!     - pre-vote phase prior to triggering an election
+//!     * log backed up by a circular buffer on disk
+//!     * most of the raft spec is supported
+//!     * up to 64 peers in one cluster
+//!     * all offsets are on 64 bits
+//!     * maximum peer lag up to whatever the underlying file is
+//!     * periodic checkpointing when enough commits went by
+//!     * I/O between peers uses byte buffers encoded using bincode
+//!     * pre-vote phase prior to triggering an election
 //!
 //!  # Log implementation
 //!
@@ -62,7 +68,7 @@
 //!
 //!  # Ideas
 //!
-//!    - force a 'commit-all' for cluster membership entries, e.g delay the commit offset index
+//!    * force a 'commit-all' for cluster membership entries, e.g delay the commit offset index
 //!      increment as long as *all* the peers are not replicated with at least that entry (and
 //!      then atomically update the conf. on all peers at once).
 //!
@@ -91,7 +97,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
-macro_rules! pretty {
+macro_rules! display {
     ($self:ident, $fmt:expr $(, $arg:expr)*) => {
         debug!(&$self.logger, $fmt, $($arg),* ;
             "term" => $self.term,
@@ -243,7 +249,8 @@ impl Default for State {
     }
 }
 
-/// Wrapper around the automaton. Public operations are exposed via a few methods.
+/// Wrapper around the automaton. Public operations are exposed via a few methods. The actual
+/// automaton implementating the protocol is not exposed.
 pub struct Raft {
     fsm: Arc<Automaton<Command>>,
 }
@@ -258,8 +265,10 @@ struct Peer {
     ack: u64,
 }
 
+/// Trait defining the raft automaton payload.
 pub trait Payload {
     fn flush(&self) -> Vec<u8>;
+    fn reset(&mut self, bytes: &[u8]) -> ();
 }
 
 ///  todo items:
@@ -298,6 +307,8 @@ where
     sink: Arc<Sink>,
     /// Payload updated upon commit, used for checkpointing
     payload: Arc<RWLock<S>>,
+    /// Latest snapshot, e.g serialized payload at the last checkpointing boundary
+    snapshot: Vec<u8>,
     /// Network out closure
     write: T,
     /// User payload update closure
@@ -358,7 +369,7 @@ where
     ) -> State {
         match opcode {
             Opcode::START => {
-                pretty!(self, "starting ({} peers)", self.peers.len());
+                display!(self, "               | | starting ({} peers)", self.peers.len());
 
                 //
                 // - by definition offset #1 is some empty marker
@@ -391,7 +402,7 @@ where
                         // - star the pre-voting cycle right away
                         //
                         self.seq += 1;
-                        pretty!(self, "{:?} pre-voting", ctx);
+                        display!(self, "{:?} | pre-voting", ctx);
                         let _ = this.post(TIMEOUT(self.seq));
                     }
                     (PREV(_), CNDT(ref ctx)) => {
@@ -403,7 +414,7 @@ where
                         //   to CANDIDATE at around the same time
                         //
                         let ms = thread_rng().gen_range(25, 150);
-                        pretty!(self, "{:?} triggering election in {} ms", ctx, ms);
+                        display!(self, "{:?}*| triggering election in {} ms", ctx, ms);
                         self.timer.schedule(
                             this.clone(),
                             TIMEOUT(self.seq),
@@ -417,7 +428,7 @@ where
                         // - reset the next/replication counters for each peer
                         // - the peer offsets are set to our head offset
                         //
-                        pretty!(self, "{:?} now leading", ctx);
+                        display!(self, "{:?}*| now leading", ctx);
                         for peer in &mut self.peers {
                             debug_assert!(*peer.0 != self.id);
                             peer.1.off = self.head;
@@ -442,7 +453,7 @@ where
                         // - we got a REPLICATE with a higher term
                         // - set our next timeout
                         //
-                        pretty!(self, "{:?} waiting for heartbeats", ctx);
+                        display!(self, "{:?} | waiting for heartbeats", ctx);
                         self.timer.schedule(
                             this.clone(),
                             TIMEOUT(self.seq),
@@ -590,7 +601,7 @@ where
                                 debug_assert!(self.head >= peer.1.ack);
                                 debug_assert!(self.head >= peer.1.off);
                                 debug_assert!(peer.1.off >= peer.1.ack, format!("id {} off {} ack {}", peer.0, peer.1.off, peer.1.ack));
-                                let rebase = if peer.1.off < self.tail {
+                                let snapshot = if peer.1.off < self.tail {
 
                                     //
                                     // - if the peer is behind our log window bump it
@@ -600,9 +611,9 @@ where
                                     //   on that peer (at least the peer will notify it was
                                     //   rebased)
                                     //
-                                    pretty!(
+                                    display!(
                                         self,
-                                        "{:?} bumping peer #{} to [#{} #{}] (lag ?)",
+                                        "{:?}*| bumping peer #{} to [#{} #{}] (lag ?)",
                                         ctx,
                                         peer.0,
                                         self.tail,
@@ -611,7 +622,7 @@ where
                                     peer.1.off = self.tail;
                                     let n = self.head - self.tail + 1;
                                     read_range!(self, append, self.tail, n);                                   
-                                    true
+                                    self.snapshot.clone()
 
                                 } else {
 
@@ -619,9 +630,9 @@ where
                                     // - we have 1+ log entries to replicate
                                     // - copy entries from [off + 1, head] to the append buffer
                                     //
-                                    pretty!(
+                                    display!(
                                         self,
-                                        "{:?} replicating [#{} .. #{}] to peer #{}",
+                                        "{:?} | replicating [#{} .. #{}] to peer #{}",
                                         ctx,
                                         peer.1.off + 1,
                                         self.head,
@@ -629,9 +640,9 @@ where
                                     );
                                     let n = self.head - peer.1.off;
                                     read_range!(self, append, peer.1.off + 1, n);
-                                    false
+                                    Vec::new()
                                 };
-
+                                
                                 //
                                 // - specify the index+term for the write offset (e.g the offset
                                 //   immediately preceding the first replicated entry)
@@ -649,7 +660,7 @@ where
                                     off: peer.1.off,
                                     age: slot.term,
                                     append,
-                                    rebase,
+                                    snapshot,
                                 };
 
                                 let bytes = msg.to_raw(&self.host, &peer.1.host);
@@ -679,7 +690,7 @@ where
                         // - make sure we have enough room in the log
                         //
                         if self.head - self.tail == FSM::<S, T, U>::RESOLUTION as u64 - 1 {
-                            pretty!(self, "{:?} discarding record (log full)", ctx);
+                            display!(self, "{:?}*| discarding record (log full)", ctx);
                         } else {
 
                             //
@@ -689,7 +700,7 @@ where
                             //
                             self.head += 1;
                             self.age = self.term;
-                            pretty!(self, "{:?} appending record ({}B)", ctx, bytes.len());
+                            display!(self, "{:?} | appending record ({}B)", ctx, bytes.len());
                             let slot = SLOT {
                                 code: 255,
                                 term: self.term,
@@ -810,9 +821,9 @@ where
                                         }
                                         drop(guard);
                                         self.commit = next;
-                                        pretty!(
+                                        display!(
                                             self,
-                                            "{:?} offset #{} committed",
+                                            "{:?} | offset #{} committed",
                                             ctx,
                                             self.commit
                                         );
@@ -820,22 +831,27 @@ where
                                         //
                                         // - if the commit index reached a checkpoint boundary
                                         //   reset the tail to that offset
-                                        // - flush the log
+                                        // - lock the payload and take a snapshot of it
+                                        // - flush the logfile
                                         // - notify the sink with a CHECKPOINT
                                         // - signal the sink event
                                         //
                                         let boundary = self.commit -
                                             (self.commit % FSM::<S, T, U>::CHECKPOINT as u64);
                                         if boundary > self.tail {
-                                            pretty!(
+                                            let guard = self.payload.read();
+                                            let mut bytes = (*guard).flush();
+                                            drop(guard);
+                                            self.snapshot.clear();
+                                            self.snapshot.append(&mut bytes);
+                                            display!(
                                                 self,
-                                                "{:?} checkpointed [#{} #{}] ",
+                                                "{:?} | snapshot [#{} #{}], {}B",
                                                 ctx,
                                                 self.tail,
-                                                boundary
+                                                boundary,
+                                                self.snapshot.len()
                                             );
-                                            // serialize the payload
-                                            //let _ = self.payload.flush();
                                             self.log.flush().unwrap();
                                             self.sink.fifo.push(Notification::CHECKPOINT(boundary));
                                             self.sink.sem.signal();
@@ -853,7 +869,7 @@ where
                                     // - this should be a rare edge case after a partition
                                     //
                                     self.term = msg.term;
-                                    pretty!(self, "{:?} stepping down", ctx);
+                                    display!(self, "{:?}*| stepping down", ctx);
                                     self.sink.fifo.push(Notification::FOLLOWING);
                                     self.sink.sem.signal();
                                     return FLWR(context::FLWR {
@@ -880,10 +896,11 @@ where
                             (self.write)(&raw.src, &bytes);
 
                         } else {
+                            let rebase = msg.snapshot.len() > 0;
                             let n = (msg.append.len() / FSM::<S, T, U>::SLOT_BYTES) as u64;
                             debug_assert!(n > 0);
                             match state {
-                                FLWR(ref mut ctx) if msg.rebase => {
+                                FLWR(ref mut ctx) if rebase => {
 
                                     //
                                     // - reset our log using the append buffer
@@ -893,16 +910,23 @@ where
                                     self.head = self.tail + n as u64 - 1;
                                     let buf = msg.append;
                                     write_range!(self, buf, msg.off, n);
-
                                     let slot = read_slot!(self, self.head);
                                     self.age = slot.term;
-                                    pretty!(
+                                    display!(
                                         self,
-                                        "{:?} rebased into [#{} #{}]",
+                                        "{:?} | rebased into [#{} #{}]",
                                         ctx,
                                         self.tail,
                                         self.head
                                     );
+
+                                    //
+                                    // - lock the payload
+                                    // - deserialize and use the snapshot we received
+                                    //
+                                    let mut guard = self.payload.write();
+                                    (*guard).reset(&msg.snapshot);
+                                    drop(guard);
 
                                     //
                                     // - emit a ACK to acknowledge our new head offset
@@ -959,9 +983,9 @@ where
                                             let slot = read_slot!(self, self.head);
                                             self.head = msg.off + n as u64;
                                             self.age = slot.term;
-                                            pretty!(
+                                            display!(
                                                 self,
-                                                "{:?} replicated [#{} #{}]",
+                                                "{:?} | replicated [#{} #{}]",
                                                 ctx,
                                                 msg.off + 1,
                                                 self.head
@@ -993,9 +1017,9 @@ where
                                         //   large steps
                                         //
                                         debug_assert!(msg.off > 0);
-                                        pretty!(
+                                        display!(
                                             self,
-                                            "{:?} conflict at [#{}|{}], rebasing",
+                                            "{:?}*| conflict at [#{}|{}], rebasing",
                                             ctx,
                                             msg.off,
                                             msg.age
@@ -1058,9 +1082,9 @@ where
                                         // - first, update the acknowledged offset for that peer
                                         //
                                         if *peer.0 == msg.id {
-                                            pretty!(
+                                            display!(
                                                 self,
-                                                "{:?} peer #{} at offset #{}",
+                                                "{:?} | peer #{} at offset #{}",
                                                 ctx,
                                                 peer.0,
                                                 msg.ack
@@ -1102,11 +1126,12 @@ where
                                         }
                                         drop(guard);
                                         self.commit = smallest;
-                                        pretty!(self, "{:?} offset #{} committed", ctx, smallest);
+                                        display!(self, "{:?} | offset #{} committed", ctx, smallest);
 
                                         //
                                         // - if the commit index reached a checkpoint boundary
                                         // - reset the tail to that offset
+                                        // - lock the payload and take a snapshot of it
                                         // - flush the log
                                         // - notify the sink with a CHECKPOINT
                                         // - signal the sink event
@@ -1114,13 +1139,19 @@ where
                                         let boundary = self.commit -
                                             (self.commit % FSM::<S, T, U>::CHECKPOINT as u64);
                                         if boundary > self.tail {
-                                            pretty!(
+                                            display!(
                                                 self,
-                                                "{:?} checkpointed [#{} #{}] ",
+                                                "{:?} | checkpointed [#{} #{}] ",
                                                 ctx,
                                                 self.tail,
                                                 boundary
                                             );
+
+                                            let guard = self.payload.read();
+                                            let mut bytes = (*guard).flush();
+                                            drop(guard);
+                                            self.snapshot.clear();
+                                            self.snapshot.append(&mut bytes);
                                             self.log.flush().unwrap();
                                             self.sink.fifo.push(Notification::CHECKPOINT(boundary));
                                             self.sink.sem.signal();
@@ -1232,9 +1263,9 @@ where
                                     let (n, granted) = self.count_votes(&mut ctx.votes, msg.id);
                                     if granted {
                                         ctx.votes = 0;
-                                        pretty!(
+                                        display!(
                                             self,
-                                            "{:?} probing quorum reached ({}/{})",
+                                            "{:?} | probing quorum reached ({}/{})",
                                             ctx,
                                             n,
                                             self.peers.len() + 1
@@ -1290,7 +1321,7 @@ where
 
                                     if granted {
                                         ctx.pick = Some(msg.id);
-                                        pretty!(self, "{:?} voted for peer #{}", ctx, msg.id);
+                                        display!(self, "{:?} | voted for peer #{}", ctx, msg.id);
 
                                         //
                                         // - the vote is granted
@@ -1334,9 +1365,9 @@ where
                                     let (n, granted) = self.count_votes(&mut ctx.votes, msg.id);
                                     if granted {
                                         ctx.votes = 0;
-                                        pretty!(
+                                        display!(
                                             self,
-                                            "{:?} voting quorum reached ({}/{})",
+                                            "{:?} | voting quorum reached ({}/{})",
                                             ctx,
                                             n,
                                             self.peers.len() + 1
@@ -1349,13 +1380,13 @@ where
                         }
                     }
                     _ => {
-                        pretty!(self, "warning, skipping invalid RPC");
+                        display!(self, "warning, skipping invalid RPC");
                         debug_assert!(false, "invalid RPC");
                     }
                 }
             }
             Opcode::DRAIN => {
-                warn!(&self.logger, "draining");
+                warn!(&self.logger, "               | | draining");
             }
             Opcode::EXIT => {
 
@@ -1376,9 +1407,17 @@ where
 }
 
 impl Raft {
-    /// Constructor method to spawn a new raft automaton. The automaton is defined by a unique u8
-    /// identifier and a network destination (e.g host+port). An optional set of seed peers may be
-    /// specified.
+    /// Constructor method to spawn a new raft automaton. It returns a triplet made of the
+    /// automaton wrapper, a read-only lock on the automaton payload and a notification sink.
+    ///
+    /// The automaton is defined by a unique u8 identifier and a network destination
+    /// (e.g host+port). An optional set of seed peers may be specified. Binary buffers that need
+    /// to be sent to a given peer are passed to the `write` closure. It is up to the user to then
+    /// transmit those buffers depending on the implementation (socket, pipe, etc).
+    ///
+    /// The method is parameterized with the payload to use: the automaton will create and own this
+    /// payload. It will also update it upon each commit via the `apply` closure.
+    ///
     pub fn spawn<S, T, U>(
         guard: Arc<Guard>,
         id: u8,
@@ -1454,6 +1493,7 @@ impl Raft {
                 log: unsafe { MmapMut::map_mut(&file).unwrap() },
                 sink: sink.clone(),
                 payload,
+                snapshot: Vec::new(),
                 write,
                 apply,
                 logger,

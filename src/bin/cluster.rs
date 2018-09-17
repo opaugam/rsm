@@ -1,4 +1,5 @@
-//! Sample application running multiple raft automata and allowing them exchange commands.
+//! Test application running multiple raft automata and allowing them to exchange commands. The
+//! leadr append record on a periodic basis.
 extern crate bincode;
 #[macro_use]
 extern crate clap;
@@ -12,7 +13,7 @@ extern crate slog;
 extern crate slog_async;
 extern crate slog_term;
 
-use bincode::serialize;
+use bincode::{deserialize, serialize};
 use rand::{Rng, thread_rng};
 use rsm::primitives::event::*;
 use rsm::raft::protocol::{Payload, Raft};
@@ -106,6 +107,11 @@ fn main() {
                 fn flush(&self) -> Vec<u8> {
                     serialize(&self).unwrap()
                 }
+
+                fn reset(&mut self, bytes: &[u8]) -> () {
+                    let msg: COUNTER = deserialize(bytes).unwrap();
+                    *self = msg;
+                }
             }
 
             //
@@ -173,7 +179,7 @@ fn main() {
                                     for _ in 0..thread_rng().gen_range(0, 10) {
                                         raft.store(Vec::new());
                                     }
-                                    thread::sleep(Duration::from_millis(50));
+                                    thread::sleep(Duration::from_millis(1000));
                                 } else {
                                     break;
                                 }

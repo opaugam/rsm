@@ -50,7 +50,7 @@ pub(super) struct REPLICATE {
     pub(super) age: u64,
     pub(super) commit: u64,
     pub(super) append: Vec<u8>,
-    pub(super) rebase: bool,
+    pub(super) snapshot: Vec<u8>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
