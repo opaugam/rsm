@@ -3,6 +3,7 @@ extern crate bincode;
 #[macro_use]
 extern crate clap;
 extern crate ctrlc;
+extern crate rand;
 extern crate rsm;
 #[macro_use]
 extern crate serde_derive;
@@ -11,9 +12,10 @@ extern crate slog;
 extern crate slog_async;
 extern crate slog_term;
 
-use bincode::{deserialize, serialize};
+use bincode::serialize;
+use rand::{Rng, thread_rng};
 use rsm::primitives::event::*;
-use rsm::raft::protocol::{Payload, Protocol};
+use rsm::raft::protocol::{Payload, Raft};
 use rsm::raft::sink::*;
 use slog::{Drain, Level, LevelFilter, Logger};
 use slog_term::{FullFormat, PlainSyncDecorator};
@@ -24,7 +26,9 @@ use std::env;
 use std::path::Path;
 use std::io::stderr;
 use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
+use std::time::Duration;
 
 fn main() {
 
@@ -70,7 +74,7 @@ fn main() {
     // - cap to 16
     //
     let size = cmp::min(value_t!(args, "SIZE", u8).unwrap_or(3), 16);
-    let peers = Arc::new(Mutex::new(HashMap::<String, Protocol>::new()));
+    let peers = Arc::new(Mutex::new(HashMap::<String, Arc<Raft>>::new()));
     for n in 0..size {
 
         let guard = guard.clone();
@@ -109,10 +113,10 @@ fn main() {
             // - retrieve a read lock on the payload plus a notification sink
             //
             let id = format!("#{}", n);
-            let (raft, lock, sink) = {
+            let (raft, _, sink) = {
                 let guard = guard.clone();
                 let shared = shared.clone();
-                Protocol::spawn::<COUNTER,_,_>(
+                Raft::spawn::<COUNTER,_,_>(
                     guard,
                     n,
                     seeds[&n].clone(),
@@ -131,6 +135,7 @@ fn main() {
 
                         //
                         // - increment the payload upon each commit
+                        // - the closure is executed with a write lock being held
                         //
                         payload.count += 1;
                     },
@@ -141,26 +146,48 @@ fn main() {
             //
             // - lock the mutex
             // - add this automaton to the shared peer map
-            //
-            {
-                let mut peers = shared.lock().unwrap();
-                peers.insert(id, raft);
-            }
-
-            //
             // - loop as long as we get notifications from the automaton
             // - we will break automatically as soon as it shuts down
             //
+            let emit = Arc::new(AtomicBool::new(false));
+            let mut peers = shared.lock().unwrap();
+            peers.insert(id, raft.clone());
+            drop(peers);
             loop {
                 match sink.next() {
                     None => break,
-                    Some(Notification::CHECKPOINT(_)) => {
+                    Some(Notification::LEADING) => {
 
                         //
-                        // -
+                        // - we are leading
+                        // - spawn a thread to periodically write an empty record
+                        // - we use an atomic boolean as a on/off trigger
                         //
-                        let guard = lock.read();
-                        info!(&log.1, "{:?}", guard.val);
+                        let raft = raft.clone();
+                        let emit = emit.clone();
+                        info!(&log.1, "starting to write");
+                        emit.store(true, Ordering::Release);
+                        let _ = thread::spawn(move || {
+                            loop {
+                                if emit.load(Ordering::Relaxed) {
+                                    for _ in 0..thread_rng().gen_range(0, 10) {
+                                        raft.store(Vec::new());
+                                    }
+                                    thread::sleep(Duration::from_millis(50));
+                                } else {
+                                    break;
+                                }
+                            }
+                        });
+
+                    }
+                    Some(Notification::FOLLOWING)| Some(Notification::IDLE) => {
+
+                        //
+                        // - we are not leading anymore
+                        // - switch to trigger off (the thread will exit if running)
+                        //
+                        emit.store(false, Ordering::Release);
                     }
                     _ => {}
                 }

@@ -8,7 +8,7 @@ macro_rules! declare {
                 let slot = SLOT {
                     code: $msg::CODE,
                     term,
-                    blob: serialize(&self).unwrap(),
+                    bytes: serialize(&self).unwrap(),
                 };
                 serialize(&slot).unwrap()
             }
@@ -17,19 +17,13 @@ macro_rules! declare {
 }
 
 declare!(0, NULL);
-declare!(1, LABEL);
 
 #[derive(Debug, Serialize, Deserialize)]
 pub(super) struct SLOT {
     pub(super) term: u64,
     pub(super) code: u8,
-    pub(super) blob: Vec<u8>,
+    pub(super) bytes: Vec<u8>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
 pub(super) struct NULL {}
-
-#[derive(Debug, Serialize, Deserialize)]
-pub(super) struct LABEL {
-    pub text: String,
-}

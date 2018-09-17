@@ -89,17 +89,13 @@ use std::fmt;
 use std::fs::OpenOptions;
 use std::path::PathBuf;
 use std::sync::Arc;
-#[cfg(feature = "chaos")]
-use std::thread;
 use std::time::Duration;
 
 macro_rules! pretty {
     ($self:ident, $fmt:expr $(, $arg:expr)*) => {
         debug!(&$self.logger, $fmt, $($arg),* ;
             "term" => $self.term,
-            "head" => $self.head,
-            "tail" => $self.tail,
-            "cmit" => $self.commit);
+            "log" => format!("[#{} #{}] (#{})", $self.tail, $self.head, $self.commit),);
     };
 }
 
@@ -248,7 +244,7 @@ impl Default for State {
 }
 
 /// Wrapper around the automaton. Public operations are exposed via a few methods.
-pub struct Protocol {
+pub struct Raft {
     fsm: Arc<Automaton<Command>>,
 }
 
@@ -566,13 +562,6 @@ where
                     }
                     LEAD(ref ctx) => {
 
-                        for _ in 0..9 {
-                            self.head += 1;
-                            self.age = self.term;
-                            let label = LABEL { text: format!("head #{}", self.head) };
-                            write_slot!(self, label.to_bytes(self.term), self.head);
-                        }
-
                         //
                         // - assert our authority by sending a PING to all our peers
                         // - any peer receiving those will turn into a FOLLOWER if not already
@@ -600,7 +589,7 @@ where
                                 let mut append = Vec::new();
                                 debug_assert!(self.head >= peer.1.ack);
                                 debug_assert!(self.head >= peer.1.off);
-                                debug_assert!(peer.1.off >= peer.1.ack);
+                                debug_assert!(peer.1.off >= peer.1.ack, format!("id {} off {} ack {}", peer.0, peer.1.off, peer.1.ack));
                                 let rebase = if peer.1.off < self.tail {
 
                                     //
@@ -613,14 +602,15 @@ where
                                     //
                                     pretty!(
                                         self,
-                                        "{:?} bumping peer #{} to offset #{} (lag ?)",
+                                        "{:?} bumping peer #{} to [#{} #{}] (lag ?)",
                                         ctx,
                                         peer.0,
-                                        self.tail
+                                        self.tail,
+                                        self.head
                                     );
                                     peer.1.off = self.tail;
                                     let n = self.head - self.tail + 1;
-                                    read_range!(self, append, self.tail, n);
+                                    read_range!(self, append, self.tail, n);                                   
                                     true
 
                                 } else {
@@ -650,8 +640,8 @@ where
                                 // - blank peers will also be able to synch-up this way
                                 // - emit a REPLICATE
                                 //
-                                let slot = read_slot!(self, peer.1.off);
                                 debug_assert!(append.len() > 0);
+                                let slot = read_slot!(self, peer.1.off);
                                 let msg = REPLICATE {
                                     id: self.id,
                                     term: self.term,
@@ -681,15 +671,15 @@ where
                     }
                 }
             }
-            Opcode::INPUT(STORE(blob)) => {
+            Opcode::INPUT(STORE(bytes)) => {
                 match state {
                     LEAD(ref ctx) => {
 
                         //
                         // - make sure we have enough room in the log
                         //
-                        if self.head - self.tail == FSM::<S, T, U>::RESOLUTION as u64 {
-                            pretty!(self, "{:?} discarding blob (log full)", ctx);
+                        if self.head - self.tail == FSM::<S, T, U>::RESOLUTION as u64 - 1 {
+                            pretty!(self, "{:?} discarding record (log full)", ctx);
                         } else {
 
                             //
@@ -699,10 +689,11 @@ where
                             //
                             self.head += 1;
                             self.age = self.term;
+                            pretty!(self, "{:?} appending record ({}B)", ctx, bytes.len());
                             let slot = SLOT {
                                 code: 255,
                                 term: self.term,
-                                blob,
+                                bytes,
                             };
                             write_slot!(self, serialize(&slot).unwrap(), self.head);
                         }
@@ -711,17 +702,6 @@ where
                 }
             }
             Opcode::INPUT(BYTES(raw)) => {
-                #[cfg(feature = "chaos")]
-                {
-                    //
-                    // - if the chaos feature is enabled randomly slow
-                    //
-                    let mut rng = thread_rng();
-                    if rng.gen_range(0, 100) > 50 {
-                        let ms = rng.gen_range(0, 500);
-                        thread::sleep(Duration::from_millis(ms));
-                    }
-                }
                 trace!(
                     &self.logger,
                     "<- {}B from {} (code #{})",
@@ -729,6 +709,17 @@ where
                     raw.src,
                     raw.code
                 );
+                #[cfg(feature = "chaos")]
+                {
+                    match raw.code {
+                        PING::CODE | REPLICATE::CODE => {
+                            if thread_rng().gen_range(0, 100) > 50 {
+                                return state;
+                            }
+                        }
+                        _ => {}
+                    }
+                }
                 match raw.code {
                     UPGRADE::CODE => {
                         let msg: UPGRADE = deserialize(&raw.msg[..]).unwrap();
@@ -815,7 +806,7 @@ where
                                         let mut guard = self.payload.write();
                                         for n in self.commit..next {
                                             let slot = read_slot!(self, n);
-                                            (self.apply)(&mut guard.val, &slot.blob);
+                                            (self.apply)(&mut guard, &slot.bytes);
                                         }
                                         drop(guard);
                                         self.commit = next;
@@ -899,7 +890,7 @@ where
                                     // - override our tail and head offsets
                                     //
                                     self.tail = msg.off;
-                                    self.head = self.tail + n as u64;
+                                    self.head = self.tail + n as u64 - 1;
                                     let buf = msg.append;
                                     write_range!(self, buf, msg.off, n);
 
@@ -1059,7 +1050,7 @@ where
                                     //
                                     let mut n = 1;
                                     let mut smallest = <u64>::max_value();
-                                    debug_assert!(msg.ack <= self.head);
+                                    debug_assert!(msg.ack <= self.head, format!("ack {} head {}", msg.ack, self.head));
                                     for peer in &mut self.peers {
                                         debug_assert!(*peer.0 != self.id);
 
@@ -1105,8 +1096,8 @@ where
                                         let mut guard = self.payload.write();
                                         for n in self.commit..smallest {
                                             let slot = read_slot!(self, n);
-                                            (self.apply)(&mut guard.val, &slot.blob);
-                                            self.sink.fifo.push(Notification::COMMIT(n, slot.blob));
+                                            (self.apply)(&mut guard, &slot.bytes);
+                                            self.sink.fifo.push(Notification::COMMIT(n, slot.bytes));
                                             self.sink.sem.signal();
                                         }
                                         drop(guard);
@@ -1384,7 +1375,7 @@ where
     }
 }
 
-impl Protocol {
+impl Raft {
     /// Constructor method to spawn a new raft automaton. The automaton is defined by a unique u8
     /// identifier and a network destination (e.g host+port). An optional set of seed peers may be
     /// specified.
@@ -1396,7 +1387,7 @@ impl Protocol {
         write: T,
         apply: U,
         logger: Logger,
-    ) -> (Self, Arc<ROLock<S>>, Arc<Sink>)
+    ) -> (Arc<Self>, Arc<ROLock<S>>, Arc<Sink>)
     where
         S: 'static + Send + Default + Payload,
         T: 'static + Send + Fn(&str, &[u8]) -> (),
@@ -1469,7 +1460,7 @@ impl Protocol {
             }),
         );
 
-        (Protocol { fsm }, lock, sink)
+        (Arc::new(Raft { fsm }), lock, sink)
     }
 
     #[allow(dead_code)]
@@ -1494,18 +1485,18 @@ impl Protocol {
     }
 
     #[allow(dead_code)]
-    pub fn store(&self, blob: Vec<u8>) -> () {
-        let _ = self.fsm.post(STORE(blob));
+    pub fn store(&self, bytes: Vec<u8>) -> () {
+        let _ = self.fsm.post(STORE(bytes));
     }
 }
 
-impl Clone for Protocol {
+impl Clone for Raft {
     fn clone(&self) -> Self {
-        Protocol { fsm: self.fsm.clone() }
+        Raft { fsm: self.fsm.clone() }
     }
 }
 
-impl Drop for Protocol {
+impl Drop for Raft {
     fn drop(&mut self) -> () {
         self.fsm.drain();
     }

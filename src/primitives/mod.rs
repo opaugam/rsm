@@ -286,6 +286,48 @@ mod tests {
     }
 
     #[test]
+    fn rw_lock() {
+
+        let lock = Arc::new(RWLock::from(0));
+        let event = Arc::new(Event::new());
+
+        {
+            let guard = event.guard();
+            for _ in 0..32 {
+
+                let lock = lock.clone();
+                let guard = guard.clone();
+                let _ = thread::spawn(move || {
+                    
+                    let val = lock.read();
+                    assert!(lock.readers() > 0);
+                    assert!(*val >= 0);
+                    random_work(40);
+                    drop(guard);
+                });
+            }
+
+            for _ in 0..32 {
+
+                let lock = lock.clone();
+                let guard = guard.clone();
+                let _ = thread::spawn(move || {
+
+                    let mut val = lock.write();
+                    assert!(lock.readers() == 0);
+                    *val += 1;
+                    assert!(*val > 0);
+                    drop(guard);
+                });
+            }
+        }
+
+        event.wait();
+        assert!(lock.readers() == 0);
+        assert!(*lock.read() == 32);
+    }
+
+    #[test]
     fn synchro_once() {
 
         let event = Arc::new(Event::new());
