@@ -6,6 +6,12 @@
 systems. It features low level primitives built on atomics as well as higher level constructs such
 as a [**Raft**](https://raft.github.io/) toolkit.
 
+The intent is to be able to quickly incorporate non-trivial functionalities in your code, for
+instance being able to elect a leader or synchronize a proper draining sequence between multiple
+threads. There are two catches: a) the crate does not implement network I/O and you are responsible
+for using whatever you prefer, b) it uses half-duplex communication, e.g message passing without
+direct acknowledgement.
+
 ### Features
 
  * Fast user-space synchronization primitives built on atomics: lock, read-write lock, gate, once,
@@ -14,9 +20,9 @@ as a [**Raft**](https://raft.github.io/) toolkit.
  * Fast [**Raft**](https://raft.github.io/) protocol 100% implemented as an automaton.
 
 
-Please note this is still a *work in progress*. It is a great educational resource for whoever
-wants to learn how things like locks or finite state-machine work. It is not yet published on
-https://crates.io/ but will be soon.
+Please note this is still a *work in progress* I am working on regularly. It is a great educational
+resource for whoever wants to learn how things like locks or finite state-machine work. It is not yet
+published on https://crates.io/ but will be soon.
 
 ### Support
 
