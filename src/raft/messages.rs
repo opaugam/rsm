@@ -4,11 +4,11 @@ macro_rules! declare {
     ($code:expr, $msg:ident) => {
         impl $msg {
             pub(super) const CODE: u8 = $code;
-            pub(super) fn to_raw(&self, src: &str, dst: &str) -> Vec<u8> {
+            pub(super) fn to_raw(&self, src: &[u8;32], dst: &[u8;32]) -> Vec<u8> {
                 let raw = RAW {
                     code: $msg::CODE,
-                    src: src.into(),
-                    dst: dst.into(),
+                    src: src.clone(),
+                    dst: dst.clone(),
                     msg: serialize(&self).unwrap(),
                 };
                 serialize(&raw).unwrap()
@@ -30,8 +30,8 @@ declare!(8, VOTE);
 #[derive(Debug, Serialize, Deserialize)]
 pub(super) struct RAW {
     pub(super) code: u8,
-    pub(super) src: String,
-    pub(super) dst: String,
+    pub(super) src: [u8; 32],
+    pub(super) dst: [u8; 32],
     pub(super) msg: Vec<u8>,
 }
 

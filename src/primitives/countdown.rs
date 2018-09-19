@@ -40,6 +40,12 @@ unsafe impl Send for Countdown {}
 
 unsafe impl Sync for Countdown {}
 
+impl Default for Countdown {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl Countdown {
     #[inline]
     pub fn new() -> Self {
@@ -78,28 +84,24 @@ impl Countdown {
 
     #[inline]
     pub fn incr(&self) -> () {
-        loop {
 
-            //
-            // - attempt to update the counter if and only if BUSY/DONE are not set
-            // - make sure to unset the RESET bit
-            //
-            match set_or_spin(
-                &self.tag,
-                0,
-                BUSY | DONE,
-                0,
-                RESET,
-                &|n| n,
-                &|c| c + 1,
-                &|_| false,
-            ) {
-                Err(cur) => {
-                    if cur & DONE > 0 {
-                        break;
-                    }
-                }
-                _ => break,
+        //
+        // - attempt to update the counter if and only if BUSY/DONE are not set
+        // - make sure to unset the RESET bit
+        //
+        while let Err(cur) = set_or_spin(
+            &self.tag,
+            0,
+            BUSY | DONE,
+            0,
+            RESET,
+            &|n| n,
+            &|c| c + 1,
+            &|_| false,
+        )
+        {
+            if cur & DONE > 0 {
+                break;
             }
         }
     }

@@ -46,6 +46,13 @@ unsafe impl<T: Send> Send for MPSC<T> {}
 
 unsafe impl<T: Send> Sync for MPSC<T> {}
 
+impl<T> Default for MPSC<T>
+{
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl<T> Drop for MPSC<T> {
     fn drop(&mut self) {
         unsafe {

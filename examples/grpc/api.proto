@@ -1,0 +1,13 @@
+syntax = "proto3";
+
+package rsm;
+
+message Empty {}
+
+message Packet {
+    bytes raw   = 1;
+}
+
+service Node {
+  rpc process (Packet) returns (Empty) {}
+}

@@ -125,7 +125,7 @@ where
                 //
                 let (until, ms) = self.tick_to_slot(Instant::now());
                 while self.n != until {
-                    let ref mut slot = self.slots[self.n];
+                    let slot = &mut self.slots[self.n];
                     loop {
                         match slot.heap.peek() {
                             Some(item) if item.tick <= ms => {}
@@ -143,7 +143,7 @@ where
             (_, Opcode::INPUT(SCHEDULE(to, msg, lapse))) => {
 
                 let (n, ms) = self.tick_to_slot(Instant::now() + lapse);
-                let ref mut slot = self.slots[n];
+                let slot = &mut self.slots[n];
                 slot.heap.push(Pending {
                     n: slot.cnt,
                     tick: ms,
@@ -171,7 +171,7 @@ where
         // - modulo into our slot array
         //
         let lapse = tick - self.epoch;
-        let ms = (1e3 * (lapse.as_secs() as f64 + lapse.subsec_nanos() as f64 * 1e-9)) as u64;
+        let ms = (1e3 * (lapse.as_secs() as f64 + f64::from(lapse.subsec_nanos()) * 1e-9)) as u64;
         let n = (ms >> 6) as usize;
         (n & (SLOTS - 1), ms)
     }

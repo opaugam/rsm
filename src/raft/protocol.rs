@@ -93,7 +93,9 @@ use std::cmp;
 use std::collections::HashMap;
 use std::fmt;
 use std::fs::OpenOptions;
+use std::hash::BuildHasher;
 use std::path::PathBuf;
+use std::str;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -256,8 +258,8 @@ pub struct Raft {
 }
 
 struct Peer {
-    /// Peer network identifier.
-    host: String,
+    /// Peer network identifier padded to 32 bytes, typically xxx.xxx.xxx.xxx:yyyy
+    host: [u8; 32],
     /// Write offset on that peer, e.g offset after which new entries will be appened. Please note
     /// this may not be its current head. It is initially set to the leader's head offset.
     off: u64,
@@ -267,8 +269,13 @@ struct Peer {
 
 /// Trait defining the raft automaton payload.
 pub trait Payload {
-    fn flush(&self) -> Vec<u8>;
-    fn reset(&mut self, bytes: &[u8]) -> ();
+    ///
+    fn flush(&self) -> Vec<u8> {
+        Vec::new()
+    }
+
+    ///
+    fn reset(&mut self, _bytes: &[u8]) -> () {}
 }
 
 ///  todo items:
@@ -277,14 +284,14 @@ pub trait Payload {
 ///       given term and erase it as soon as we're not candidate anymore ?)
 struct FSM<S, T, U>
 where
-    S: 'static + Send + Default + Payload,
-    T: 'static + Send + Fn(&str, &[u8]) -> (),
-    U: 'static + Send + Fn(&mut S, &[u8]) -> (),
+    S: 'static + Send + Fn(&[u8; 32], &[u8]) -> (),
+    T: 'static + Send + Fn(&mut U, &[u8]) -> (),
+    U: 'static + Send + Default + Payload,
 {
     /// Local peer index in [0, 64].
     id: u8,
     /// Local network identifier.
-    host: String,
+    host: [u8; 32],
     /// Sequence counter, used to disambiguiate timeouts.
     seq: u64,
     /// Current peer term, persisted.
@@ -306,28 +313,28 @@ where
     /// Notification sink
     sink: Arc<Sink>,
     /// Payload updated upon commit, used for checkpointing
-    payload: Arc<RWLock<S>>,
+    payload: Arc<RWLock<U>>,
     /// Latest snapshot, e.g serialized payload at the last checkpointing boundary
     snapshot: Vec<u8>,
     /// Network out closure
-    write: T,
+    write: S,
     /// User payload update closure
-    apply: U,
+    apply: T,
     /// Slog logger
     logger: Logger,
 }
 
 impl<S, T, U> FSM<S, T, U>
 where
-    S: 'static + Send + Default + Payload,
-    T: 'static + Send + Fn(&str, &[u8]) -> (),
-    U: 'static + Send + Fn(&mut S, &[u8]) -> (),
+    S: 'static + Send + Fn(&[u8; 32], &[u8]) -> (),
+    T: 'static + Send + Fn(&mut U, &[u8]) -> (),
+    U: 'static + Send + Default + Payload,
 {
     //
     // - various timeouts in milliseconds
     //
-    const LIVENESS_TIMEOUT: u64 = 1000;
-    const ELECTION_TIMEOUT: u64 = 250;
+    const LIVENESS_TIMEOUT: u64 = 3000;
+    const ELECTION_TIMEOUT: u64 = 750;
 
     //
     // - log topology (slot width, etc.)
@@ -357,9 +364,9 @@ where
 
 impl<S, T, U> Recv<Command, State> for FSM<S, T, U>
 where
-    S: 'static + Send + Default + Payload,
-    T: 'static + Send + Fn(&str, &[u8]) -> (),
-    U: 'static + Send + Fn(&mut S, &[u8]) -> (),
+    S: 'static + Send + Fn(&[u8; 32], &[u8]) -> (),
+    T: 'static + Send + Fn(&mut U, &[u8]) -> (),
+    U: 'static + Send + Default + Payload,
 {
     fn recv(
         &mut self,
@@ -369,7 +376,11 @@ where
     ) -> State {
         match opcode {
             Opcode::START => {
-                display!(self, "               | | starting ({} peers)", self.peers.len());
+                display!(
+                    self,
+                    "               | | starting ({} peers)",
+                    self.peers.len()
+                );
 
                 //
                 // - by definition offset #1 is some empty marker
@@ -480,6 +491,7 @@ where
                         ctx.pick = None;
                         for peer in &self.peers {
                             debug_assert!(*peer.0 != self.id);
+
                             let msg = PROBE {
                                 id: self.id,
                                 term: self.term + 1,
@@ -487,13 +499,14 @@ where
                                 age: self.age,
                             };
                             let bytes = msg.to_raw(&self.host, &peer.1.host);
-                            (self.write)(&peer.1.host.clone(), &bytes);
+                            (self.write)(&peer.1.host, &bytes);
+                            display!(self, "{:?} | probing peer #{}", ctx, peer.0);
                         }
 
                         //
                         // - set the next election timeout
                         // - we will cycle on PREVOTE as long as we don't get promoted
-                        //   to FOLLOWER and don't get quorum
+                        //   to CANDIDATE and don't get quorum
                         //
                         self.timer.schedule(
                             this.clone(),
@@ -509,6 +522,7 @@ where
                             // - return to PREVOTE to start a new cycle
                             // - note we reset the context
                             //
+                            display!(self, "{:?} | election failed, returning to pre-voting", ctx);
                             return PREV(Default::default());
                         }
 
@@ -600,7 +614,10 @@ where
                                 let mut append = Vec::new();
                                 debug_assert!(self.head >= peer.1.ack);
                                 debug_assert!(self.head >= peer.1.off);
-                                debug_assert!(peer.1.off >= peer.1.ack, format!("id {} off {} ack {}", peer.0, peer.1.off, peer.1.ack));
+                                debug_assert!(
+                                    peer.1.off >= peer.1.ack,
+                                    format!("id {} off {} ack {}", peer.0, peer.1.off, peer.1.ack)
+                                );
                                 let snapshot = if peer.1.off < self.tail {
 
                                     //
@@ -621,7 +638,7 @@ where
                                     );
                                     peer.1.off = self.tail;
                                     let n = self.head - self.tail + 1;
-                                    read_range!(self, append, self.tail, n);                                   
+                                    read_range!(self, append, self.tail, n);
                                     self.snapshot.clone()
 
                                 } else {
@@ -642,7 +659,7 @@ where
                                     read_range!(self, append, peer.1.off + 1, n);
                                     Vec::new()
                                 };
-                                
+
                                 //
                                 // - specify the index+term for the write offset (e.g the offset
                                 //   immediately preceding the first replicated entry)
@@ -651,7 +668,7 @@ where
                                 // - blank peers will also be able to synch-up this way
                                 // - emit a REPLICATE
                                 //
-                                debug_assert!(append.len() > 0);
+                                debug_assert!(!append.is_empty());
                                 let slot = read_slot!(self, peer.1.off);
                                 let msg = REPLICATE {
                                     id: self.id,
@@ -683,8 +700,7 @@ where
                 }
             }
             Opcode::INPUT(STORE(bytes)) => {
-                match state {
-                    LEAD(ref ctx) => {
+                if let LEAD(ref ctx) = state {
 
                         //
                         // - make sure we have enough room in the log
@@ -709,15 +725,13 @@ where
                             write_slot!(self, serialize(&slot).unwrap(), self.head);
                         }
                     }
-                    _ => {}
-                }
             }
             Opcode::INPUT(BYTES(raw)) => {
                 trace!(
                     &self.logger,
                     "<- {}B from {} (code #{})",
                     raw.msg.len(),
-                    raw.src,
+                    str::from_utf8(&raw.src).unwrap(),
                     raw.code
                 );
                 #[cfg(feature = "chaos")]
@@ -791,6 +805,12 @@ where
                                     });
                                 }
                                 FLWR(ref mut ctx) => {
+                                    display!(
+                                        self,
+                                        "{:?} | heartbeat received from peer #{}",
+                                        ctx,
+                                        msg.id
+                                    );
                                     if ctx.leader.is_none() {
 
                                         //
@@ -896,7 +916,7 @@ where
                             (self.write)(&raw.src, &bytes);
 
                         } else {
-                            let rebase = msg.snapshot.len() > 0;
+                            let rebase = !msg.snapshot.is_empty();
                             let n = (msg.append.len() / FSM::<S, T, U>::SLOT_BYTES) as u64;
                             debug_assert!(n > 0);
                             match state {
@@ -1053,9 +1073,7 @@ where
                             let bytes = msg.to_raw(&self.host, &raw.src);
                             (self.write)(&raw.src, &bytes);
 
-                        } else {
-                            match state {
-                                LEAD(ref mut ctx) => {
+                        } else if let LEAD(ref mut ctx) = state {
 
                                     //
                                     // - a FOLLOWER just confirmed how much it now replicates
@@ -1074,7 +1092,10 @@ where
                                     //
                                     let mut n = 1;
                                     let mut smallest = <u64>::max_value();
-                                    debug_assert!(msg.ack <= self.head, format!("ack {} head {}", msg.ack, self.head));
+                                    debug_assert!(
+                                        msg.ack <= self.head,
+                                        format!("ack {} head {}", msg.ack, self.head)
+                                    );
                                     for peer in &mut self.peers {
                                         debug_assert!(*peer.0 != self.id);
 
@@ -1121,12 +1142,19 @@ where
                                         for n in self.commit..smallest {
                                             let slot = read_slot!(self, n);
                                             (self.apply)(&mut guard, &slot.bytes);
-                                            self.sink.fifo.push(Notification::COMMIT(n, slot.bytes));
+                                            self.sink.fifo.push(
+                                                Notification::COMMIT(n, slot.bytes),
+                                            );
                                             self.sink.sem.signal();
                                         }
                                         drop(guard);
                                         self.commit = smallest;
-                                        display!(self, "{:?} | offset #{} committed", ctx, smallest);
+                                        display!(
+                                            self,
+                                            "{:?} | offset #{} committed",
+                                            ctx,
+                                            smallest
+                                        );
 
                                         //
                                         // - if the commit index reached a checkpoint boundary
@@ -1158,9 +1186,7 @@ where
                                             self.tail = boundary;
                                         }
                                     }
-                                }
-                                _ => {}
-                            }
+                            
                         }
                     }
                     REBASE::CODE => {
@@ -1178,9 +1204,7 @@ where
                             let bytes = msg.to_raw(&self.host, &raw.src);
                             (self.write)(&raw.src, &bytes);
 
-                        } else {
-                            match state {
-                                LEAD(_) => {
+                        } else if let LEAD(_) = state {
 
                                     //
                                     // - the FOLLOWER is unable to match the check mark we
@@ -1190,9 +1214,7 @@ where
                                     let mut peer = self.peers.get_mut(&msg.id).unwrap();
                                     peer.off = 1;
                                     peer.ack = 0;
-                                }
-                                _ => {}
-                            }
+                            
                         }
                     }
                     PROBE::CODE => {
@@ -1248,10 +1270,7 @@ where
                             };
                             let bytes = msg.to_raw(&self.host, &raw.src);
                             (self.write)(&raw.src, &bytes);
-                        } else {
-                            match state {
-                                PREV(ref mut ctx) => {
-
+                        } else if let PREV(ref mut ctx) = state {
                                     //
                                     // - we are in the pre-voting phase
                                     // - this vote does not count, we are just using it to
@@ -1272,9 +1291,6 @@ where
                                         );
                                         return CNDT(*ctx);
                                     }
-                                }
-                                _ => {}
-                            }
                         }
                     }
                     ADVERTISE::CODE => {
@@ -1354,14 +1370,18 @@ where
                             };
                             let bytes = msg.to_raw(&self.host, &raw.src);
                             (self.write)(&raw.src, &bytes);
-                        } else {
-                            match state {
-                                CNDT(ref mut ctx) => {
+                        } else if let CNDT(ref mut ctx) = state {
 
                                     //
                                     // - same as above except this is the real election
                                     // - if we reach quorum this time transition to LEADER
                                     //
+                                    display!(
+                                        self,
+                                        "{:?} | vote received from peer #{}",
+                                        ctx,
+                                        msg.id
+                                    );
                                     let (n, granted) = self.count_votes(&mut ctx.votes, msg.id);
                                     if granted {
                                         ctx.votes = 0;
@@ -1374,9 +1394,7 @@ where
                                         );
                                         return LEAD(Default::default());
                                     }
-                                }
-                                _ => {}
-                            }
+                            
                         }
                     }
                     _ => {
@@ -1418,41 +1436,41 @@ impl Raft {
     /// The method is parameterized with the payload to use: the automaton will create and own this
     /// payload. It will also update it upon each commit via the `apply` closure.
     ///
-    pub fn spawn<S, T, U>(
-        guard: Arc<Guard>,
+    pub fn spawn<'a, S, T, U, V:BuildHasher>(
+        guard: &Arc<Guard>,
         id: u8,
-        host: String,
-        seeds: Option<HashMap<u8, String>>,
-        write: T,
-        apply: U,
+        mut peers: HashMap<u8, &'a str, V>,
+        write: S,
+        apply: T,
         logger: Logger,
-    ) -> (Arc<Self>, Arc<ROLock<S>>, Arc<Sink>)
+    ) -> (Arc<Self>, Arc<ROLock<U>>, Arc<Sink>)
     where
-        S: 'static + Send + Default + Payload,
-        T: 'static + Send + Fn(&str, &[u8]) -> (),
-        U: 'static + Send + Fn(&mut S, &[u8]) -> (),
+        S: 'static + Send + Fn(&[u8; 32], &[u8]) -> (),
+        T: 'static + Send + Fn(&mut U, &[u8]) -> (),
+        U: 'static + Send + Default + Payload,
     {
         //
         // - turn the specified id/host mapping into our peer map
         // - make sure to remove any entry that would be using our peer id
         //
-        let peers: HashMap<_, _> = if let Some(mut map) = seeds {
-            map.retain(|&n, _| n != id);
-            map.iter()
-                .map(|(n, h)| {
-                    (
-                        *n,
-                        Peer {
-                            host: h.clone(),
-                            off: 1,
-                            ack: 1,
-                        },
-                    )
-                })
-                .collect()
-        } else {
-            HashMap::new()
-        };
+        assert!(peers.len() < 64, "only 64 peers max are supported");
+        assert!(id < peers.len() as u8, "id={} but on {} peers are specified", id, peers.len());
+        assert!(peers.contains_key(&id), "{} not found in the specified map", id);
+        let host = Raft::get_host(peers[&id]);
+        peers.retain(|&n, _| n != id);
+        let peers: HashMap<_, _> = peers
+            .iter()
+            .map(|(n, host)| {
+                (
+                    *n,
+                    Peer {
+                        host: Raft::get_host(host),
+                        off: 1,
+                        ack: 1,
+                    },
+                )
+            })
+            .collect();
 
         //
         // - setup the log file
@@ -1503,6 +1521,14 @@ impl Raft {
         (Arc::new(Raft { fsm }), lock, sink)
     }
 
+    #[inline]
+    pub fn get_host(tag: &str) -> [u8; 32] {
+        let mut buf = [0; 32];
+        let n = cmp::min(tag.len(), 32);
+        buf[..n].copy_from_slice(&tag.as_bytes()[..n]);
+        buf     
+    }
+
     #[allow(dead_code)]
     pub fn drain(&self) -> () {
         self.fsm.drain();
@@ -1516,11 +1542,8 @@ impl Raft {
         // - cast to a RAW
         // - silently discard if invalid
         //
-        match deserialize(&bytes[..]) {
-            Ok(raw) => {
-                let _ = self.fsm.post(BYTES(raw));
-            }
-            _ => {}
+        if let Ok(raw) = deserialize(&bytes[..]) {
+            let _ = self.fsm.post(BYTES(raw));
         }
     }
 

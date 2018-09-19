@@ -1,5 +1,5 @@
 //! Test application running multiple raft automata and allowing them to exchange commands. The
-//! leadr append record on a periodic basis.
+//! leader append a random number of empty records on a periodic basis.
 extern crate bincode;
 #[macro_use]
 extern crate clap;
@@ -26,6 +26,7 @@ use std::collections::HashMap;
 use std::env;
 use std::path::Path;
 use std::io::stderr;
+use std::str;
 use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
@@ -56,34 +57,25 @@ fn main() {
     //
     // - optionally chdir if the --chdir argument is set
     //
-    match value_t!(args, "CHDIR", String) {
-        Ok(root) => {
-            let path = Path::new(&root);
-            assert!(env::set_current_dir(&path).is_ok(), "unable to chdir");
-        }
-        _ => {}
+    if let Ok(root) = value_t!(args, "CHDIR", String) {
+        let path = Path::new(&root);
+        assert!(env::set_current_dir(&path).is_ok(), "unable to chdir");
     }
 
     //
     // - use a termination event to synchronize our shutdown sequence
+    // - start a few raft automata using the --size CLI argument
+    // - cap to 15 automata
     //
     let event = Arc::new(Event::new());
     let guard = event.guard();
+    let size = cmp::min(value_t!(args, "SIZE", u8).unwrap_or(3), 15);
+    let peers = Arc::new(Mutex::new(HashMap::<[u8; 32], Arc<Raft>>::new()));
 
-    //
-    // - start a few raft automata using the --size CLI argument
-    // - cap to 16
-    //
-    let size = cmp::min(value_t!(args, "SIZE", u8).unwrap_or(3), 16);
-    let peers = Arc::new(Mutex::new(HashMap::<String, Arc<Raft>>::new()));
-    for n in 0..size {
-
+    for id in 0..size {
         let guard = guard.clone();
         let shared = peers.clone();
-        let log = (
-            root.new(o!("sys" => "raft", "id" => n)),
-            root.new(o!("sys" => "events")),
-        );
+        let log = root.new(o!("sys" => "raft", "id" => id));
         let _ = thread::spawn(move || {
 
             //
@@ -91,15 +83,15 @@ fn main() {
             // - this is similar to the zookeeper configuration
             // - instead of a host:port our network destination is a simple label
             //
-            let seeds : HashMap<_, _> = (0..size).map(|n| (n, format!("#{}", n))).collect();
-
+            let tags: Vec<_> = (0..size).map(|n| format!("automaton #{}", n)).collect();
+            let seeds: HashMap<_, _> = tags.iter().enumerate().map(|(n, tag)|  (n as u8, tag.as_str())).collect();
+           
             //
             // - define our payload, e.g the stateful information to which each commit
             //   will be applied to by the automaton
             //
             #[derive(Debug, Default, Serialize, Deserialize)]
             struct COUNTER {
-
                 count: u64,
             }
 
@@ -118,15 +110,13 @@ fn main() {
             // - start a new automata
             // - retrieve a read lock on the payload plus a notification sink
             //
-            let id = format!("#{}", n);
             let (raft, _, sink) = {
                 let guard = guard.clone();
                 let shared = shared.clone();
-                Raft::spawn::<COUNTER,_,_>(
-                    guard,
-                    n,
-                    seeds[&n].clone(),
-                    Some(seeds),
+                Raft::spawn::<_, _, COUNTER, _>(
+                    &guard,
+                    id,
+                    seeds,
                     move |host, bytes| {
 
                         //
@@ -145,20 +135,24 @@ fn main() {
                         //
                         payload.count += 1;
                     },
-                    log.0,
+                    log,
                 )
             };
 
             //
             // - lock the mutex
             // - add this automaton to the shared peer map
+            //
+            {
+                let mut peers = shared.lock().unwrap();
+                peers.insert(Raft::get_host(tags[id as usize].as_str()), raft.clone());
+            }
+
+            //
             // - loop as long as we get notifications from the automaton
             // - we will break automatically as soon as it shuts down
             //
             let emit = Arc::new(AtomicBool::new(false));
-            let mut peers = shared.lock().unwrap();
-            peers.insert(id, raft.clone());
-            drop(peers);
             loop {
                 match sink.next() {
                     None => break,
@@ -171,23 +165,26 @@ fn main() {
                         //
                         let raft = raft.clone();
                         let emit = emit.clone();
-                        info!(&log.1, "starting to write");
                         emit.store(true, Ordering::Release);
-                        let _ = thread::spawn(move || {
-                            loop {
-                                if emit.load(Ordering::Relaxed) {
-                                    for _ in 0..thread_rng().gen_range(0, 10) {
-                                        raft.store(Vec::new());
-                                    }
-                                    thread::sleep(Duration::from_millis(1000));
-                                } else {
-                                    break;
+                        let _ = thread::spawn(move || loop {
+                            if emit.load(Ordering::Relaxed) {
+
+                                //
+                                // - we are leading, write up to 10 empty records
+                                // - pause the thread and loop back
+                                //
+                                for _ in 0..thread_rng().gen_range(0, 10) {
+                                    raft.store(Vec::new());
                                 }
+                                thread::sleep(Duration::from_millis(1000));
+                            } else {
+                                break;
                             }
                         });
 
                     }
-                    Some(Notification::FOLLOWING)| Some(Notification::IDLE) => {
+                    Some(Notification::FOLLOWING) |
+                    Some(Notification::IDLE) => {
 
                         //
                         // - we are not leading anymore
@@ -204,7 +201,6 @@ fn main() {
             // - the event guard will now drop
             // - once all the guards drop the final termination event will signal
             //
-            info!(&log.1, "thread {} exiting", n);
         });
     }
 
@@ -225,7 +221,8 @@ fn main() {
                 // - upon termination it will signal the notification sink and drop its guard
                 //
                 peer.1.drain();
-        }}).unwrap();
+            }
+        }).unwrap();
     }
 
     //

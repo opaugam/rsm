@@ -19,17 +19,21 @@ slog-term    = "2.4"
 [dev-dependencies]
 criterion = "0.2"
 
-[[bench]]
-name = "locking"
-harness = false
-
 [lib]
 name = "rsm"
 path = "src/lib.rs"
 
 [[bin]]
-name = "cluster"
-path = "src/bin/cluster.rs"
+name = "local"
+path = "examples/local/main.rs"
+
+[[bin]]
+name = "grpc"
+path = "examples/grpc/main.rs"
+
+[[bench]]
+name = "locking"
+harness = false
 
 [features]
 chaos = []
