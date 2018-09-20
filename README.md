@@ -19,10 +19,29 @@ direct acknowledgement.
  * Basic finite state-machine automata, great for building actor systems!
  * Fast [**Raft**](https://raft.github.io/) protocol 100% implemented as an automaton.
 
-
 Please note this is still a *work in progress* I am working on regularly. It is a great educational
 resource for whoever wants to learn how things like locks or finite state-machine work. It is not yet
 published on https://crates.io/ but will be soon.
+
+### Example
+
+You often want to experiment when building your next distributed system and want to concentrate on what
+matter most. You can efficiently use [**Python**](https://www.python.org/) as a front-end, for instance
+to enable [**gRPC**](https://grpc.io/) I/O between your nodes, processing configuration files, etc!
+
+The aptly named [grpc](examples/grpc) example provides the protobuf API definition to encapsulate messages,
+a python front-end buffering over unix pipes and sub-processing a rust executable. Try it (assuming you both
+have python and grpc installed):
+
+```
+$ cargo build --bin grpc
+$ cd examples/grpc
+$ mkdir api
+$ python -m grpc_tools.protoc -I. --python_out=./api --grpc_python_out=./api api.proto
+$ python peer.py --id 0
+```
+
+Et voila, a raft peer is up and running ready to communicate to form a cluster!
 
 ### Support
 
