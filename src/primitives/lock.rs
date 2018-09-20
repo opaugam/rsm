@@ -5,13 +5,14 @@
 //! and will spin, attempting to flip the lock without going to sleep.
 //!
 //! The locking/unlocking paths allow for barging, e.g lock preemption while in unlock().
-//! This allows to manage high micro-contention and minimizes calls to wait()/notify_one().
+//! This allows to manage high micro-contention and minimizes calls to `wait()` or
+//! `notify_one()`.
 //!
 //! The LIFO strategy is not fair in the sense 2+ threads could hog the lock. The
 //! FIFO strategy is fair and will guarantee each thread gets the same exposure.
 //!
 //! The locks are slightly heavier memory wise than for instance what's described in
-//! https://webkit.org/blog/6161/locking-in-webkit/ but the code is drastically
+//! [webkit](https://webkit.org/blog/6161/locking-in-webkit/) but the code is drastically
 //! simpler. The cost per lock is 16 bytes (state + 1 pointer).
 //!
 //! Please note each lock may carry 32bits of user payload. Both lock() and unlock()
@@ -40,8 +41,8 @@ pub struct Lock<T>
 where
     T: Strategy,
 {
-    tag: AtomicUsize,
-    queue: T,
+    pub(super) tag: AtomicUsize,
+    pub(super) queue: T,
 }
 
 unsafe impl<T> Send for Lock<T>
@@ -76,11 +77,9 @@ where
 
     #[inline]
     pub fn with(tag: u32) -> Self {
-        let mut tag = tag as usize;
-        tag <<= 32;
         Lock {
-            tag: AtomicUsize::new(tag),
-            queue: Default::default(),
+            tag: AtomicUsize::new((tag as usize) << 32),
+            queue: T::default(),
         }
     }
 
@@ -108,17 +107,19 @@ where
         //
         let cur = self.tag.load(Ordering::Relaxed);
         let user = update((cur >> 32) as u32);
-        match self.tag.compare_exchange_weak(
-            cur & !LOCK,
-            (cur & !USR_MSK) | ((user as usize) << 32) | LOCK,
-            Ordering::Acquire,
-            Ordering::Relaxed,
-        ) {
-            Ok(_) => {}
-            _ => unsafe {
+        if self.tag
+            .compare_exchange_weak(
+                cur & !LOCK,
+                (cur & !USR_MSK) | ((user as usize) << 32) | LOCK,
+                Ordering::Acquire,
+                Ordering::Relaxed,
+            )
+            .is_err()
+        {
+            unsafe {
                 self.lock_cold(update);
-            },
-        }
+            }
+        };
     }
 
     #[cold]
@@ -221,16 +222,18 @@ where
         //
         let cur = self.tag.load(Ordering::Relaxed);
         let user = update((cur >> 32) as u32);
-        match self.tag.compare_exchange_weak(
-            (cur & !PENDING) | LOCK,
-            (cur & !(LOCK | USR_MSK)) | ((user as usize) << 32),
-            Ordering::Acquire,
-            Ordering::Relaxed,
-        ) {
-            Ok(_) => {}
-            _ => unsafe {
+        if self.tag
+            .compare_exchange_weak(
+                (cur & !PENDING) | LOCK,
+                (cur & !(LOCK | USR_MSK)) | ((user as usize) << 32),
+                Ordering::Acquire,
+                Ordering::Relaxed,
+            )
+            .is_err()
+        {
+            unsafe {
                 self.unlock_cold(update);
-            },
+            }
         }
     }
 

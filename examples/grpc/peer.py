@@ -99,10 +99,11 @@ if __name__ == "__main__":
                             # - invoke a process() RPC
                             # @todo use a cache for the channel
                             #
-                            channel = grpc.insecure_channel(str(host)) 
-                            stub = api_pb2_grpc.NodeStub(channel)
-                            stub.process(api_pb2.Packet(raw=payload[32:]))
-
+                            if 0:
+                                channel = grpc.insecure_channel(str(host)) 
+                                stub = api_pb2_grpc.NodeStub(channel)
+                                stub.process(api_pb2.Packet(raw=payload[32:]))
+                            time.sleep(3600.0)
                         except:
                             pass
 

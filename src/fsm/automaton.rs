@@ -24,8 +24,9 @@ pub enum Errors {
 }
 
 #[derive(Debug)]
-pub enum Opcode<T, U> 
-where U: PartialEq
+pub enum Opcode<T, U>
+where
+    U: PartialEq,
 {
     START,
     INPUT(T),
@@ -43,7 +44,7 @@ use self::Opcode::*;
 pub trait Recv<T, U>: Send
 where
     T: Send,
-    U: PartialEq
+    U: PartialEq,
 {
     fn recv(&mut self, this: &Arc<Automaton<T>>, state: U, opcode: Opcode<T, U>) -> U;
 }

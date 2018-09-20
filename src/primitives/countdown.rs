@@ -21,7 +21,7 @@ const POISON: usize = 8;
 ///
 /// Each run() invokation decrements the counter. Once it drops to zero the closure
 /// is run after which the countdown is disabled. A panic in the closure will set
-/// the POISON bit at which point has_failed() would return true. Please note that
+/// the POISON bit at which point `has_failed()` would return true. Please note that
 /// the closure is run at most once with no retries (e.g even if it panics).
 ///
 /// By default the countdown is reset (e.g won't run anything) and must be activated
@@ -54,8 +54,7 @@ impl Countdown {
 
     #[inline]
     pub fn with(tag: u32) -> Self {
-        let tag = tag as usize;
-        Countdown { tag: AtomicUsize::new(RESET | (tag << 32)) }
+        Countdown { tag: AtomicUsize::new(RESET | ((tag as usize) << 32)) }
     }
 
     #[inline]
@@ -107,9 +106,9 @@ impl Countdown {
     }
 
     #[inline]
-    pub fn run<F>(&self, f: &F) -> ()
+    pub fn run<F, T>(&self, f: F) -> Option<T>
     where
-        F: Fn() -> (),
+        F: Fn() -> T,
     {
 
         //
@@ -124,7 +123,7 @@ impl Countdown {
         //
         let cur = self.tag.load(Ordering::Relaxed);
         if cur & (RESET | DONE) > 0 {
-            return;
+            return None;
         }
         let mut cnt = (cur & CNT_MSK) >> 8;
         if cnt > 1 {
@@ -135,25 +134,25 @@ impl Countdown {
                 Ordering::Acquire,
                 Ordering::Relaxed,
             ) {
-                Ok(_) => {}
+                Ok(_) => None,
                 Err(prv) => unsafe {
                     if prv & DONE == 0 {
-                        self.run_cold(f);
+                        self.run_cold(f)
+                    } else {
+                        None
                     }
                 },
             }
         } else {
-            unsafe {
-                self.run_cold(f);
-            }
+            unsafe { self.run_cold(f) }
         }
     }
 
     #[cold]
     #[inline(never)]
-    unsafe fn run_cold<F>(&self, f: &F) -> ()
+    unsafe fn run_cold<F, T>(&self, f: F) -> Option<T>
     where
-        F: Fn() -> (),
+        F: Fn() -> T,
     {
 
         //
@@ -190,6 +189,8 @@ impl Countdown {
                 &|_| true,
             );
 
+            None
+
         } else if cur & DONE > 0 {
 
             //
@@ -197,6 +198,7 @@ impl Countdown {
             // - unset the BUSY bit
             //
             self.tag.fetch_sub(BUSY, Ordering::Acquire);
+            None
 
         } else {
 
@@ -222,9 +224,10 @@ impl Countdown {
                 }
             }
             let guard = _Guard(&self.tag);
-            f();
+            let val = f();
             mem::forget(guard);
             let _ = set_or_spin(&self.tag, BUSY, DONE, DONE, BUSY, &|n| n, &|_| 0, &|_| true);
+            Some(val)
         }
     }
 }

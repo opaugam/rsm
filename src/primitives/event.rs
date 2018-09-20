@@ -1,8 +1,8 @@
 //! A simple "auto reset event" (e.g semaphore capped to 1) as described in the excellent
-//! http://preshing.com/20150316/semaphores-are-surprisingly-versatile/ post. This construct
-//! can typically be used to wake threads up when work is available. An additional guard is
-//! also provided to allow for signaling the event when the guard drops (very handy to wait
-//! for a group of threads to complete work).
+//! [preshing blog](http://preshing.com/20150316/semaphores-are-surprisingly-versatile/) post.
+//! This construct can typically be used to wake threads up when work is available. An additional
+//! guard is also provided to allow for signaling the event when the guard drops (very handy to
+//! wait for a group of threads to complete work).
 //!
 //! Please note each event may carry 32bits of user payload.
 use self::semaphore::*;

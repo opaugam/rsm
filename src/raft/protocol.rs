@@ -81,6 +81,7 @@ use fsm::automaton::{Automaton, Opcode, Recv};
 use fsm::timer::Timer;
 use memmap::MmapMut;
 use primitives::event::*;
+use primitives::once::*;
 use primitives::rwlock::*;
 use raft::messages::*;
 use raft::sink::*;
@@ -221,7 +222,6 @@ enum State {
     LEAD(context::LEAD),
 }
 
-#[cfg_attr(rustfmt, rustfmt_skip)]
 impl PartialEq for State {
     fn eq(&self, other: &State) -> bool {
 
@@ -230,11 +230,11 @@ impl PartialEq for State {
         //   to do simple state comparisons
         //
         match (*self, *other) {
-            (PREV(_),   PREV(_)) => true,
-            (CNDT(_),   CNDT(_)) => true,
-            (FLWR(_),   FLWR(_)) => true,
-            (LEAD(_),   LEAD(_)) => true,
-            _ =>                    false,
+            (PREV(_), PREV(_)) |
+            (CNDT(_), CNDT(_)) |
+            (FLWR(_), FLWR(_)) |
+            (LEAD(_), LEAD(_)) => true,
+            _ => false,
         }
     }
 }
@@ -247,9 +247,17 @@ impl Default for State {
         // - we either will receive a heartbeat or time out and
         //   initiate a new election cycle
         //
-        State::FLWR(Default::default())
+        State::FLWR(context::FLWR::default())
     }
 }
+
+/// Opaque placeholder for the ancillary data
+pub struct Ancillary {
+    timer: Arc<Timer<Command>>,
+}
+
+/// Ancillary data shared by all raft automata, as a once construct
+pub static ANCILLARY: Once<Ancillary> = Once::new();
 
 /// Wrapper around the automaton. Public operations are exposed via a few methods. The actual
 /// automaton implementating the protocol is not exposed.
@@ -280,7 +288,7 @@ pub trait Payload {
 
 ///  todo items:
 ///    o) membership add()/remove()
-///    o) the latest vote must be persisted (e.g persist an empty _NO_VOTE file under /tmp for a
+///    o) the latest vote must be persisted (e.g persist an empty file under /tmp for a
 ///       given term and erase it as soon as we're not candidate anymore ?)
 struct FSM<S, T, U>
 where
@@ -307,7 +315,7 @@ where
     /// Map of peer id <-> host + offsets
     peers: HashMap<u8, Peer>,
     /// Internal timer automaton used to enforce timeouts
-    timer: Timer<Command>,
+    timer: Arc<Timer<Command>>,
     /// Memory mapped log file on disk, used as a circular buffer
     log: MmapMut,
     /// Notification sink
@@ -523,7 +531,7 @@ where
                             // - note we reset the context
                             //
                             display!(self, "{:?} | election failed, returning to pre-voting", ctx);
-                            return PREV(Default::default());
+                            return PREV(context::CNDT::default());
                         }
 
                         //
@@ -582,7 +590,7 @@ where
                             //
                             self.sink.fifo.push(Notification::IDLE);
                             self.sink.sem.signal();
-                            return PREV(Default::default());
+                            return PREV(context::CNDT::default());
                         }
                     }
                     LEAD(ref ctx) => {
@@ -702,29 +710,29 @@ where
             Opcode::INPUT(STORE(bytes)) => {
                 if let LEAD(ref ctx) = state {
 
-                        //
-                        // - make sure we have enough room in the log
-                        //
-                        if self.head - self.tail == FSM::<S, T, U>::RESOLUTION as u64 - 1 {
-                            display!(self, "{:?}*| discarding record (log full)", ctx);
-                        } else {
+                    //
+                    // - make sure we have enough room in the log
+                    //
+                    if self.head - self.tail == FSM::<S, T, U>::RESOLUTION as u64 - 1 {
+                        display!(self, "{:?}*| discarding record (log full)", ctx);
+                    } else {
 
-                            //
-                            // - increment the head offset
-                            // - update the term tracker for the head
-                            // - add the entry to the log
-                            //
-                            self.head += 1;
-                            self.age = self.term;
-                            display!(self, "{:?} | appending record ({}B)", ctx, bytes.len());
-                            let slot = SLOT {
-                                code: 255,
-                                term: self.term,
-                                bytes,
-                            };
-                            write_slot!(self, serialize(&slot).unwrap(), self.head);
-                        }
+                        //
+                        // - increment the head offset
+                        // - update the term tracker for the head
+                        // - add the entry to the log
+                        //
+                        self.head += 1;
+                        self.age = self.term;
+                        display!(self, "{:?} | appending record ({}B)", ctx, bytes.len());
+                        let slot = SLOT {
+                            code: 255,
+                            term: self.term,
+                            bytes,
+                        };
+                        write_slot!(self, serialize(&slot).unwrap(), self.head);
                     }
+                }
             }
             Opcode::INPUT(BYTES(raw)) => {
                 trace!(
@@ -1075,118 +1083,111 @@ where
 
                         } else if let LEAD(ref mut ctx) = state {
 
-                                    //
-                                    // - a FOLLOWER just confirmed how much it now replicates
-                                    // - we now need to check there is enough evidence for us to
-                                    //   increment our commit offset (e.g do we have a quorum of
-                                    //   peers whose acknowledged offset is > our commit offset)
-                                    // - this is conveyed in the original paper as
-                                    //
-                                    //    "If there exists an N such that N > commitIndex, a
-                                    //     majority of matchIndex[i] ≥ N, and
-                                    //     log[N].term == currentTerm:
-                                    //     set commitIndex = N (§5.3, §5.4)."
-                                    //
-                                    // - note the quorum count is initialized at 1 since we have to
-                                    //   count ourselves (we are maintaining the log)
-                                    //
-                                    let mut n = 1;
-                                    let mut smallest = <u64>::max_value();
-                                    debug_assert!(
-                                        msg.ack <= self.head,
-                                        format!("ack {} head {}", msg.ack, self.head)
+                            //
+                            // - a FOLLOWER just confirmed how much it now replicates
+                            // - we now need to check there is enough evidence for us to
+                            //   increment our commit offset (e.g do we have a quorum of
+                            //   peers whose acknowledged offset is > our commit offset)
+                            // - this is conveyed in the original paper as
+                            //
+                            //    "If there exists an N such that N > commitIndex, a
+                            //     majority of matchIndex[i] ≥ N, and
+                            //     log[N].term == currentTerm:
+                            //     set commitIndex = N (§5.3, §5.4)."
+                            //
+                            // - note the quorum count is initialized at 1 since we have to
+                            //   count ourselves (we are maintaining the log)
+                            //
+                            let mut n = 1;
+                            let mut smallest = <u64>::max_value();
+                            debug_assert!(
+                                msg.ack <= self.head,
+                                format!("ack {} head {}", msg.ack, self.head)
+                            );
+                            for peer in &mut self.peers {
+                                debug_assert!(*peer.0 != self.id);
+
+                                //
+                                // - first, update the acknowledged offset for that peer
+                                //
+                                if *peer.0 == msg.id {
+                                    display!(
+                                        self,
+                                        "{:?} | peer #{} at offset #{}",
+                                        ctx,
+                                        peer.0,
+                                        msg.ack
                                     );
-                                    for peer in &mut self.peers {
-                                        debug_assert!(*peer.0 != self.id);
+                                    peer.1.ack = msg.ack;
+                                }
 
-                                        //
-                                        // - first, update the acknowledged offset for that peer
-                                        //
-                                        if *peer.0 == msg.id {
-                                            display!(
-                                                self,
-                                                "{:?} | peer #{} at offset #{}",
-                                                ctx,
-                                                peer.0,
-                                                msg.ack
-                                            );
-                                            peer.1.ack = msg.ack;
-                                        }
-
-                                        //
-                                        // - any peer whose confirmed replicated offset is > to
-                                        //   our commit is part of the quorum set
-                                        // - keep the smallest of those offsets
-                                        //
-                                        if peer.1.ack > self.commit {
-                                            if peer.1.ack < smallest {
-                                                smallest = peer.1.ack;
-                                            }
-                                            n += 1;
-                                        }
+                                //
+                                // - any peer whose confirmed replicated offset is > to
+                                //   our commit is part of the quorum set
+                                // - keep the smallest of those offsets
+                                //
+                                if peer.1.ack > self.commit {
+                                    if peer.1.ack < smallest {
+                                        smallest = peer.1.ack;
                                     }
+                                    n += 1;
+                                }
+                            }
 
-                                    //
-                                    // - do we have quorum ?
-                                    //
-                                    if n > self.peers.len() >> 1 {
+                            //
+                            // - do we have quorum ?
+                            //
+                            if n > self.peers.len() >> 1 {
 
-                                        //
-                                        // - notify the sink with a COMMIT for each entry
-                                        // - update our commit offset to the smallest replicated
-                                        //   offset reported by the quorum peers
-                                        // - signal the sink event
-                                        //
-                                        debug_assert!(smallest >= self.tail);
-                                        let mut guard = self.payload.write();
-                                        for n in self.commit..smallest {
-                                            let slot = read_slot!(self, n);
-                                            (self.apply)(&mut guard, &slot.bytes);
-                                            self.sink.fifo.push(
-                                                Notification::COMMIT(n, slot.bytes),
-                                            );
-                                            self.sink.sem.signal();
-                                        }
-                                        drop(guard);
-                                        self.commit = smallest;
-                                        display!(
-                                            self,
-                                            "{:?} | offset #{} committed",
-                                            ctx,
-                                            smallest
-                                        );
+                                //
+                                // - notify the sink with a COMMIT for each entry
+                                // - update our commit offset to the smallest replicated
+                                //   offset reported by the quorum peers
+                                // - signal the sink event
+                                //
+                                debug_assert!(smallest >= self.tail);
+                                let mut guard = self.payload.write();
+                                for n in self.commit..smallest {
+                                    let slot = read_slot!(self, n);
+                                    (self.apply)(&mut guard, &slot.bytes);
+                                    self.sink.fifo.push(Notification::COMMIT(n, slot.bytes));
+                                    self.sink.sem.signal();
+                                }
+                                drop(guard);
+                                self.commit = smallest;
+                                display!(self, "{:?} | offset #{} committed", ctx, smallest);
 
-                                        //
-                                        // - if the commit index reached a checkpoint boundary
-                                        // - reset the tail to that offset
-                                        // - lock the payload and take a snapshot of it
-                                        // - flush the log
-                                        // - notify the sink with a CHECKPOINT
-                                        // - signal the sink event
-                                        //
-                                        let boundary = self.commit -
-                                            (self.commit % FSM::<S, T, U>::CHECKPOINT as u64);
-                                        if boundary > self.tail {
-                                            display!(
-                                                self,
-                                                "{:?} | checkpointed [#{} #{}] ",
-                                                ctx,
-                                                self.tail,
-                                                boundary
-                                            );
+                                //
+                                // - if the commit index reached a checkpoint boundary
+                                // - reset the tail to that offset
+                                // - lock the payload and take a snapshot of it
+                                // - flush the log
+                                // - notify the sink with a CHECKPOINT
+                                // - signal the sink event
+                                //
+                                let boundary = self.commit -
+                                    (self.commit % FSM::<S, T, U>::CHECKPOINT as u64);
+                                if boundary > self.tail {
+                                    display!(
+                                        self,
+                                        "{:?} | checkpointed [#{} #{}] ",
+                                        ctx,
+                                        self.tail,
+                                        boundary
+                                    );
 
-                                            let guard = self.payload.read();
-                                            let mut bytes = (*guard).flush();
-                                            drop(guard);
-                                            self.snapshot.clear();
-                                            self.snapshot.append(&mut bytes);
-                                            self.log.flush().unwrap();
-                                            self.sink.fifo.push(Notification::CHECKPOINT(boundary));
-                                            self.sink.sem.signal();
-                                            self.tail = boundary;
-                                        }
-                                    }
-                            
+                                    let guard = self.payload.read();
+                                    let mut bytes = (*guard).flush();
+                                    drop(guard);
+                                    self.snapshot.clear();
+                                    self.snapshot.append(&mut bytes);
+                                    self.log.flush().unwrap();
+                                    self.sink.fifo.push(Notification::CHECKPOINT(boundary));
+                                    self.sink.sem.signal();
+                                    self.tail = boundary;
+                                }
+                            }
+
                         }
                     }
                     REBASE::CODE => {
@@ -1206,15 +1207,15 @@ where
 
                         } else if let LEAD(_) = state {
 
-                                    //
-                                    // - the FOLLOWER is unable to match the check mark we
-                                    //   specified during replication: reset the peer offsets
-                                    // - we will rebase it upon the next heartbeat
-                                    //
-                                    let mut peer = self.peers.get_mut(&msg.id).unwrap();
-                                    peer.off = 1;
-                                    peer.ack = 0;
-                            
+                            //
+                            // - the FOLLOWER is unable to match the check mark we
+                            //   specified during replication: reset the peer offsets
+                            // - we will rebase it upon the next heartbeat
+                            //
+                            let mut peer = self.peers.get_mut(&msg.id).unwrap();
+                            peer.off = 1;
+                            peer.ack = 0;
+
                         }
                     }
                     PROBE::CODE => {
@@ -1271,26 +1272,26 @@ where
                             let bytes = msg.to_raw(&self.host, &raw.src);
                             (self.write)(&raw.src, &bytes);
                         } else if let PREV(ref mut ctx) = state {
-                                    //
-                                    // - we are in the pre-voting phase
-                                    // - this vote does not count, we are just using it to
-                                    //   check if we can reach quorum or not
-                                    // - this is like testing for reachability
-                                    // - if we get quorum transition to CANDIDATE to trigger the
-                                    //   real election (and reset the votes bit array)
-                                    //
-                                    let (n, granted) = self.count_votes(&mut ctx.votes, msg.id);
-                                    if granted {
-                                        ctx.votes = 0;
-                                        display!(
-                                            self,
-                                            "{:?} | probing quorum reached ({}/{})",
-                                            ctx,
-                                            n,
-                                            self.peers.len() + 1
-                                        );
-                                        return CNDT(*ctx);
-                                    }
+                            //
+                            // - we are in the pre-voting phase
+                            // - this vote does not count, we are just using it to
+                            //   check if we can reach quorum or not
+                            // - this is like testing for reachability
+                            // - if we get quorum transition to CANDIDATE to trigger the
+                            //   real election (and reset the votes bit array)
+                            //
+                            let (n, granted) = self.count_votes(&mut ctx.votes, msg.id);
+                            if granted {
+                                ctx.votes = 0;
+                                display!(
+                                    self,
+                                    "{:?} | probing quorum reached ({}/{})",
+                                    ctx,
+                                    n,
+                                    self.peers.len() + 1
+                                );
+                                return CNDT(*ctx);
+                            }
                         }
                     }
                     ADVERTISE::CODE => {
@@ -1372,29 +1373,24 @@ where
                             (self.write)(&raw.src, &bytes);
                         } else if let CNDT(ref mut ctx) = state {
 
-                                    //
-                                    // - same as above except this is the real election
-                                    // - if we reach quorum this time transition to LEADER
-                                    //
-                                    display!(
-                                        self,
-                                        "{:?} | vote received from peer #{}",
-                                        ctx,
-                                        msg.id
-                                    );
-                                    let (n, granted) = self.count_votes(&mut ctx.votes, msg.id);
-                                    if granted {
-                                        ctx.votes = 0;
-                                        display!(
-                                            self,
-                                            "{:?} | voting quorum reached ({}/{})",
-                                            ctx,
-                                            n,
-                                            self.peers.len() + 1
-                                        );
-                                        return LEAD(Default::default());
-                                    }
-                            
+                            //
+                            // - same as above except this is the real election
+                            // - if we reach quorum this time transition to LEADER
+                            //
+                            display!(self, "{:?} | vote received from peer #{}", ctx, msg.id);
+                            let (n, granted) = self.count_votes(&mut ctx.votes, msg.id);
+                            if granted {
+                                ctx.votes = 0;
+                                display!(
+                                    self,
+                                    "{:?} | voting quorum reached ({}/{})",
+                                    ctx,
+                                    n,
+                                    self.peers.len() + 1
+                                );
+                                return LEAD(context::LEAD::default());
+                            }
+
                         }
                     }
                     _ => {
@@ -1425,6 +1421,7 @@ where
 }
 
 impl Raft {
+
     /// Constructor method to spawn a new raft automaton. It returns a triplet made of the
     /// automaton wrapper, a read-only lock on the automaton payload and a notification sink.
     ///
@@ -1436,7 +1433,7 @@ impl Raft {
     /// The method is parameterized with the payload to use: the automaton will create and own this
     /// payload. It will also update it upon each commit via the `apply` closure.
     ///
-    pub fn spawn<'a, S, T, U, V:BuildHasher>(
+    pub fn spawn<'a, S, T, U, V: BuildHasher>(
         guard: &Arc<Guard>,
         id: u8,
         mut peers: HashMap<u8, &'a str, V>,
@@ -1450,13 +1447,30 @@ impl Raft {
         U: 'static + Send + Default + Payload,
     {
         //
+        // - retrieve (and create upon the first invokation) our ancillary data, namely a shared
+        //   timer automaton use to fire timeout notifications
+        //
+        let global = ANCILLARY.run( || { 
+            Ancillary {timer: Arc::new(Timer::spawn(guard.clone())) }
+            });
+
+        //
         // - turn the specified id/host mapping into our peer map
         // - make sure to remove any entry that would be using our peer id
         //
         assert!(peers.len() < 64, "only 64 peers max are supported");
-        assert!(id < peers.len() as u8, "id={} but on {} peers are specified", id, peers.len());
-        assert!(peers.contains_key(&id), "{} not found in the specified map", id);
-        let host = Raft::get_host(peers[&id]);
+        assert!(
+            id < peers.len() as u8,
+            "id={} but on {} peers are specified",
+            id,
+            peers.len()
+        );
+        assert!(
+            peers.contains_key(&id),
+            "{} not found in the specified map",
+            id
+        );
+        let host = Self::get_host(peers[&id]);
         peers.retain(|&n, _| n != id);
         let peers: HashMap<_, _> = peers
             .iter()
@@ -1464,7 +1478,7 @@ impl Raft {
                 (
                     *n,
                     Peer {
-                        host: Raft::get_host(host),
+                        host: Self::get_host(host),
                         off: 1,
                         ack: 1,
                     },
@@ -1507,7 +1521,7 @@ impl Raft {
                 age: 0,
                 commit: 1,
                 peers,
-                timer: Timer::spawn(guard.clone()),
+                timer: global.timer.clone(),
                 log: unsafe { MmapMut::map_mut(&file).unwrap() },
                 sink: sink.clone(),
                 payload,
@@ -1518,7 +1532,7 @@ impl Raft {
             }),
         );
 
-        (Arc::new(Raft { fsm }), lock, sink)
+        (Arc::new(Self { fsm }), lock, sink)
     }
 
     #[inline]
@@ -1526,7 +1540,7 @@ impl Raft {
         let mut buf = [0; 32];
         let n = cmp::min(tag.len(), 32);
         buf[..n].copy_from_slice(&tag.as_bytes()[..n]);
-        buf     
+        buf
     }
 
     #[allow(dead_code)]
@@ -1555,7 +1569,7 @@ impl Raft {
 
 impl Clone for Raft {
     fn clone(&self) -> Self {
-        Raft { fsm: self.fsm.clone() }
+        Self { fsm: self.fsm.clone() }
     }
 }
 

@@ -71,7 +71,6 @@ fn main() {
     let guard = event.guard();
     let size = cmp::min(value_t!(args, "SIZE", u8).unwrap_or(3), 15);
     let peers = Arc::new(Mutex::new(HashMap::<[u8; 32], Arc<Raft>>::new()));
-
     for id in 0..size {
         let guard = guard.clone();
         let shared = peers.clone();
@@ -84,8 +83,11 @@ fn main() {
             // - instead of a host:port our network destination is a simple label
             //
             let tags: Vec<_> = (0..size).map(|n| format!("automaton #{}", n)).collect();
-            let seeds: HashMap<_, _> = tags.iter().enumerate().map(|(n, tag)|  (n as u8, tag.as_str())).collect();
-           
+            let seeds: HashMap<_, _> = tags.iter()
+                .enumerate()
+                .map(|(n, tag)| (n as u8, tag.as_str()))
+                .collect();
+
             //
             // - define our payload, e.g the stateful information to which each commit
             //   will be applied to by the automaton
@@ -205,14 +207,21 @@ fn main() {
     }
 
     //
-    // - trap SIGINT/SIGTERM and drain the state machine
-    // - the state machine will signal the termination event upon going down
-    // - start consuming from the sink
-    // - as soon as next() fails on a None we can move on and wait for termination
+    // - trap SIGINT/SIGTERM to properly terminate all threads
+    // - each thread will signal the termination event
     //
     {
         let shared = peers.clone();
         ctrlc::set_handler(move || {
+
+            //
+            // - terminate the ancillary threads for raft::protocol
+            //
+            rsm::raft::protocol::ANCILLARY.reset();
+
+            //
+            // - terminate the automata one by one
+            //
             let peers = shared.lock().unwrap();
             for peer in &*peers {
 

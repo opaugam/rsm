@@ -162,6 +162,7 @@ impl<T> FSM<T>
 where
     T: Send + 'static,
 {
+    #![cfg_attr(feature = "cargo-clippy", allow(cast_sign_loss, cast_precision_loss))]
     #[inline]
     fn tick_to_slot(&self, tick: Instant) -> (usize, u64) {
 

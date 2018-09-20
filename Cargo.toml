@@ -2,6 +2,7 @@
 name = "rsm"
 version = "0.1.0"
 authors = ["Olivier Paugam <opaugam@gmail.com>"]
+autobins = false
 
 [dependencies]
 bincode      = "1.0"

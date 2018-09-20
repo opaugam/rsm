@@ -12,15 +12,15 @@ struct State<T> {
     cell: RefCell<T>,
 }
 
-/// Basic read-write lock exposing 2 read()/write() methods returning guards holding a reference
-/// to the underlying value. The one obtained via write() is a mutable reference. The lock is
+/// Basic read-write lock exposing 2 `read()`/`write()` methods returning guards holding a reference
+/// to the underlying value. The one obtained via `write()` is a mutable reference. The lock is
 /// released once the guard drops.
 pub struct RWLock<T> {
     state: Arc<State<T>>,
 }
 
-/// Same as the RWLock except it does not expose write() plus is not constructible. The only
-/// way to get it is to derive it from a RWLock instance.
+/// Same as the `RWLock` except it does not expose `write()` plus is not constructible. The only
+/// way to get it is to derive it from a `RWLock` instance.
 pub struct ROLock<T> {
     state: Arc<State<T>>,
 }

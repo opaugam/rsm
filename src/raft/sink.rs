@@ -36,7 +36,7 @@ impl Sink {
 
     pub(super) fn new() -> Self {
 
-        Sink {
+        Self {
             sem: Semaphore::new(),
             fifo: MPSC::new(),
         }

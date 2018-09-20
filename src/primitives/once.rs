@@ -1,48 +1,84 @@
-//! A simple "once" (e.g countdown of 1) owning a closure. This construct can typically be
-//! used to run some init/de-init code precisely one time only. It will also attempt to run
-//! its closure upon dropping.
-use self::countdown::*;
+//! A simple "once" (e.g a singleton) owning a closure. This construct is typically used to
+//! run some initialization code or create some shared object. It holds a value that is constructed
+//! by the closure and remains accessible throughout its lifetime. The closure will not be invoked
+//! if and only if `run()` is never invoked before the once drops.
+//!
+//! The once can also be reset at anytime which will drop any data it holds.
+use self::lock::*;
+use std::cell::RefCell;
+use std::ptr;
+use std::sync::atomic::AtomicUsize;
 use super::*;
 
-/// Trivial once wrapping a countdown of 1 and a closure.
-pub struct Once<F>
-where
-    F: Fn() -> (),
-{
-    once: Countdown,
-    f: F,
+pub struct Once<T> {
+    lock: Lock<FIFO>,
+    cell: RefCell<*mut Wrapper<T>>,
 }
 
-impl<F> Once<F>
-where
-    F: Fn() -> (),
-{
+struct Wrapper<T> {
+    val: T,
+}
+
+impl<T> Once<T> {
     #[inline]
-    pub fn from(f: F) -> Self {
-        let once = Countdown::new();
+    pub const fn new() -> Self {
+        Self {
+            lock: Lock {
+                tag: AtomicUsize::new(0),
+                queue: FIFO { head: UnsafeCell::new(ptr::null_mut()) },
+            },
+            cell: RefCell::new(ptr::null_mut()),
+        }
+    }
+
+    pub fn run<'a, F>(&self, f: F) -> &'a T
+    where
+        F: Fn() -> T,
+    {
+        self.lock.lock(|n| n);
 
         //
-        // - activate the countdown by calling incr() once
+        // - run the closure upon the first lock
+        // - box and keep track of the pointer using the cell
+        // - don't forget to increment when releasing the lock
         //
-        once.incr();
-        Once { once, f }
+        if self.lock.tag() == 0 {
+            let p = Box::into_raw(Box::new(Wrapper { val: f() }));
+            *self.cell.borrow_mut() = p;
+        }
+        self.lock.unlock(|n| n + 1);
+        unsafe {
+            let p = *self.cell.borrow();
+            &(*p).val
+        }
     }
 
     #[inline]
-    pub fn run(&self) -> () {
-        self.once.run(&self.f);
+    pub fn reset(&self) -> () {
+
+        //
+        // - release the pointer if and only if we have a value
+        //
+        self.lock.lock(|n| n);
+        if self.lock.tag() > 0 {
+            let p = *self.cell.borrow();
+            debug_assert!(!p.is_null());
+            let _: Box<Wrapper<T>> = unsafe { Box::from_raw(p) };
+        }
+
+        //
+        // - reset the count to 0
+        //
+        self.lock.unlock(|_| 0);
     }
 }
 
-impl<F> Drop for Once<F>
-where
-    F: Fn() -> (),
-{
+unsafe impl<T> Sync for Once<T> {}
+
+unsafe impl<T> Send for Once<T> {}
+
+impl<T> Drop for Once<T> {
     fn drop(&mut self) -> () {
-
-        //
-        // - run the once upon its own drop() in case nobody invoked it
-        //
-        self.run();
+        self.reset();
     }
 }

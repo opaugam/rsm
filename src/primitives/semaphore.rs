@@ -61,7 +61,7 @@ impl Semaphore {
         tag <<= 32;
         Semaphore {
             tag: AtomicUsize::new(tag),
-            queue: Default::default(),
+            queue: self::LIFO::default(),
         }
     }
 
@@ -155,16 +155,18 @@ impl Semaphore {
         //   open and nobody is locking the queue)
         // - any failure defaults to the slow path
         //
-        match self.tag.compare_exchange_weak(
-            (cur & !(BUSY | CLOSED)) | OPEN,
-            (cur & !CNT_MSK) | ((cnt + 1) << 8),
-            Ordering::Acquire,
-            Ordering::Relaxed,
-        ) {
-            Ok(_) => {}
-            _ => unsafe {
+        if self.tag
+            .compare_exchange_weak(
+                (cur & !(BUSY | CLOSED)) | OPEN,
+                (cur & !CNT_MSK) | ((cnt + 1) << 8),
+                Ordering::Acquire,
+                Ordering::Relaxed,
+            )
+            .is_err()
+        {
+            unsafe {
                 self.signal_cold();
-            },
+            }
         }
     }
 
@@ -259,16 +261,18 @@ impl Semaphore {
         }
         let cnt = (cur & CNT_MSK) >> 8;
         if cnt > 1 {
-            match self.tag.compare_exchange_weak(
-                (cur & !BUSY) | OPEN,
-                (cur & !CNT_MSK) | ((cnt - 1) << 8),
-                Ordering::Acquire,
-                Ordering::Relaxed,
-            ) {
-                Ok(_) => {}
-                _ => unsafe {
+            if self.tag
+                .compare_exchange_weak(
+                    (cur & !BUSY) | OPEN,
+                    (cur & !CNT_MSK) | ((cnt - 1) << 8),
+                    Ordering::Acquire,
+                    Ordering::Relaxed,
+                )
+                .is_err()
+            {
+                unsafe {
                     self.wait_cold();
-                },
+                }
             }
 
         } else {

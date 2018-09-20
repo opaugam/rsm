@@ -81,13 +81,30 @@ fn main() {
     let event = Arc::new(Event::new());
     let guard = event.guard();
     let id = value_t!(args, "ID", u8).unwrap();
-    let (_raft, _, _) = pipe::spawn::<_, Empty, _>(
+    let (raft, _, _) = pipe::spawn::<_, Empty, _>(
         &guard,
         id,
         peers,
         |_, _| {},
         root.new(o!("sys" => "raft", "id"=>id)),
     );
+
+    //
+    // - trap SIGINT/SIGTERM to properly terminate all threads
+    // - each thread will signal the termination event
+    //
+    {
+        ctrlc::set_handler(move || {
+
+            //
+            // - terminate the ancillary threads for raft::protocol
+            // - drain the raft automaton
+            //
+            rsm::raft::protocol::ANCILLARY.reset();
+            raft.drain();
+
+        }).unwrap();
+    }
 
     //
     // - block on the termination event

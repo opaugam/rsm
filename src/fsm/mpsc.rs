@@ -1,5 +1,5 @@
-//! Basic MPSC queue. Also check out http://www.1024cores.net/home/lock-free-algorithms/queues
-//! for more interesting ideas.
+//! Basic MPSC queue. Also for more interesting ideas check out the
+//! [1024cores blob](http://www.1024cores.net/home/lock-free-algorithms/queues).
 use std::boxed::Box;
 use std::cell::UnsafeCell;
 use std::ptr;
@@ -46,8 +46,7 @@ unsafe impl<T: Send> Send for MPSC<T> {}
 
 unsafe impl<T: Send> Sync for MPSC<T> {}
 
-impl<T> Default for MPSC<T>
-{
+impl<T> Default for MPSC<T> {
     fn default() -> Self {
         Self::new()
     }

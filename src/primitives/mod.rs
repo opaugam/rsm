@@ -330,39 +330,23 @@ mod tests {
     #[test]
     fn synchro_once() {
 
-        let event = Arc::new(Event::new());
-        let once = {
-            let event = event.clone();
-            Arc::new(Once::from(move || { event.signal(); }))
-        };
-
-        let _ = thread::spawn(move || { drop(once); });
-
-        event.wait();
-    }
-
-    #[test]
-    fn synchro_once_2() {
-
         let lock = Arc::new(Lock::<FIFO>::new());
         let event = Arc::new(Event::new());
-        let once = {
-            let lock = lock.clone();
-            Arc::new(Once::from(move || {
-                lock.lock(|n| n);
-                lock.unlock(|n| n + 1);
-            }))
-        };
+        let once = Arc::new(Once::new());
 
         {
             let guard = event.guard();
             for _ in 0..64 {
 
                 let once = once.clone();
+                let lock = lock.clone();
                 let guard = guard.clone();
                 let _ = thread::spawn(move || {
 
-                    once.run();
+                    once.run(move || {
+                        lock.lock(|n| n);
+                        lock.unlock(|n| n + 1);
+                    });
                     drop(guard);
                 });
             }

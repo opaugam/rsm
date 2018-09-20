@@ -6,7 +6,16 @@
 #![deny(rust_2018_idioms)]
 #![deny(unused)]
 #![deny(unused_imports)]
-#![cfg_attr(feature = "cargo-clippy", allow(cyclomatic_complexity, mutex_atomic, too_many_arguments))]
+#![feature(const_fn)]
+#![cfg_attr(feature = "cargo-clippy", feature(tool_lints))]
+#![cfg_attr(feature = "cargo-clippy", warn(clippy, clippy_pedantic))]
+#![cfg_attr(feature = "cargo-clippy", allow(
+    cast_possible_truncation,
+    cyclomatic_complexity,
+    enum_glob_use,
+    mutex_atomic,
+    too_many_arguments,
+    use_self))]
 extern crate bincode;
 extern crate memmap;
 extern crate rand;

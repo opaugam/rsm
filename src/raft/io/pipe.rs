@@ -58,6 +58,9 @@ where
                     }
                 }
 
+                //
+                // - the wrapped line writer in stdout() will flush upon 0x0a (which is fine)
+                //
                 assert!(n > 0);
                 let _ = pipe.write(&preamble[..n]).unwrap();
                 let _ = pipe.write(&host[..]).unwrap();
