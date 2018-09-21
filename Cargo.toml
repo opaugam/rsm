@@ -25,12 +25,12 @@ name = "rsm"
 path = "src/lib.rs"
 
 [[bin]]
-name = "local"
-path = "examples/local/main.rs"
-
-[[bin]]
 name = "grpc"
 path = "examples/grpc/main.rs"
+
+[[bin]]
+name = "stdin"
+path = "examples/stdin/main.rs"
 
 [[bench]]
 name = "locking"

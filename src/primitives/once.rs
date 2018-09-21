@@ -10,6 +10,7 @@ use std::ptr;
 use std::sync::atomic::AtomicUsize;
 use super::*;
 
+/// Once construct built from a lock plus a pointer.
 pub struct Once<T> {
     lock: Lock<FIFO>,
     cell: RefCell<*mut Wrapper<T>>,
@@ -23,6 +24,11 @@ impl<T> Once<T> {
     #[inline]
     pub const fn new() -> Self {
         Self {
+
+            //
+            // - the lock is constructed directly
+            // - this is required since this is a constant function
+            //
             lock: Lock {
                 tag: AtomicUsize::new(0),
                 queue: FIFO { head: UnsafeCell::new(ptr::null_mut()) },
@@ -54,6 +60,11 @@ impl<T> Once<T> {
     }
 
     #[inline]
+    pub fn is_reset(&self) -> bool {
+        self.lock.tag() == 0
+    }
+
+    #[inline]
     pub fn reset(&self) -> () {
 
         //
@@ -67,7 +78,8 @@ impl<T> Once<T> {
         }
 
         //
-        // - reset the count to 0
+        // - reset the count to 0 at which point run() may be invoked again and will execute
+        //   its closure
         //
         self.lock.unlock(|_| 0);
     }

@@ -80,8 +80,6 @@ use bincode::{serialize, deserialize};
 use fsm::automaton::{Automaton, Opcode, Recv};
 use fsm::timer::Timer;
 use memmap::MmapMut;
-use primitives::event::*;
-use primitives::once::*;
 use primitives::rwlock::*;
 use raft::messages::*;
 use raft::sink::*;
@@ -93,9 +91,6 @@ use slog::Logger;
 use std::cmp;
 use std::collections::HashMap;
 use std::fmt;
-use std::fs::OpenOptions;
-use std::hash::BuildHasher;
-use std::path::PathBuf;
 use std::str;
 use std::sync::Arc;
 use std::time::Duration;
@@ -208,14 +203,14 @@ mod context {
     }
 }
 
-enum Command {
+pub(super) enum Command {
     BYTES(RAW),
     STORE(Vec<u8>),
     TIMEOUT(u64),
 }
 
 #[derive(Copy, Clone)]
-enum State {
+pub(super) enum State {
     PREV(context::CNDT),
     CNDT(context::CNDT),
     FLWR(context::FLWR),
@@ -251,28 +246,20 @@ impl Default for State {
     }
 }
 
-/// Opaque placeholder for the ancillary data
-pub struct Ancillary {
-    timer: Arc<Timer<Command>>,
-}
-
-/// Ancillary data shared by all raft automata, as a once construct
-pub static ANCILLARY: Once<Ancillary> = Once::new();
-
 /// Wrapper around the automaton. Public operations are exposed via a few methods. The actual
 /// automaton implementating the protocol is not exposed.
 pub struct Raft {
-    fsm: Arc<Automaton<Command>>,
+    pub(super) fsm: Arc<Automaton<Command>>,
 }
 
-struct Peer {
+pub(super) struct Peer {
     /// Peer network identifier padded to 32 bytes, typically xxx.xxx.xxx.xxx:yyyy
-    host: [u8; 32],
+    pub(super) host: [u8; 32],
     /// Write offset on that peer, e.g offset after which new entries will be appened. Please note
     /// this may not be its current head. It is initially set to the leader's head offset.
-    off: u64,
+    pub(super) off: u64,
     /// Last acknowledged offset (e.g commit offset).
-    ack: u64,
+    pub(super) ack: u64,
 }
 
 /// Trait defining the raft automaton payload.
@@ -290,46 +277,46 @@ pub trait Payload {
 ///    o) membership add()/remove()
 ///    o) the latest vote must be persisted (e.g persist an empty file under /tmp for a
 ///       given term and erase it as soon as we're not candidate anymore ?)
-struct FSM<S, T, U>
+pub(super) struct FSM<S, T, U>
 where
     S: 'static + Send + Fn(&[u8; 32], &[u8]) -> (),
     T: 'static + Send + Fn(&mut U, &[u8]) -> (),
     U: 'static + Send + Default + Payload,
 {
     /// Local peer index in [0, 64].
-    id: u8,
+    pub(super) id: u8,
     /// Local network identifier.
-    host: [u8; 32],
+    pub(super) host: [u8; 32],
     /// Sequence counter, used to disambiguiate timeouts.
-    seq: u64,
+    pub(super) seq: u64,
     /// Current peer term, persisted.
-    term: u64,
+    pub(super) term: u64,
     /// Last log offset we maintain, starts at #1.
-    head: u64,
+    pub(super) head: u64,
     /// First log offset we maintain, starts at #1.
-    tail: u64,
+    pub(super) tail: u64,
     /// Term at the log tail (e.g how long ago was that entry appended).
-    age: u64,
+    pub(super) age: u64,
     /// Current commit offset, as reported by a quorum, starts at #1.
-    commit: u64,
+    pub(super) commit: u64,
     /// Map of peer id <-> host + offsets
-    peers: HashMap<u8, Peer>,
+    pub(super) peers: HashMap<u8, Peer>,
     /// Internal timer automaton used to enforce timeouts
-    timer: Arc<Timer<Command>>,
+    pub(super) timer: Arc<Timer<Command>>,
     /// Memory mapped log file on disk, used as a circular buffer
-    log: MmapMut,
+    pub(super) log: MmapMut,
     /// Notification sink
-    sink: Arc<Sink>,
+    pub(super) sink: Arc<Sink>,
     /// Payload updated upon commit, used for checkpointing
-    payload: Arc<RWLock<U>>,
+    pub(super) payload: Arc<RWLock<U>>,
     /// Latest snapshot, e.g serialized payload at the last checkpointing boundary
-    snapshot: Vec<u8>,
+    pub(super) snapshot: Vec<u8>,
     /// Network out closure
-    write: S,
+    pub(super) write: S,
     /// User payload update closure
-    apply: T,
+    pub(super) apply: T,
     /// Slog logger
-    logger: Logger,
+    pub(super) logger: Logger,
 }
 
 impl<S, T, U> FSM<S, T, U>
@@ -347,8 +334,8 @@ where
     //
     // - log topology (slot width, etc.)
     //
-    const SLOT_BYTES: usize = 1024;
-    const RESOLUTION: usize = 128;
+    pub(super) const SLOT_BYTES: usize = 1024;
+    pub(super) const RESOLUTION: usize = 128;
     const CHECKPOINT: usize = 15;
 
     fn count_votes(&self, votes: &mut u64, id: u8) -> (u8, bool) {
@@ -461,8 +448,8 @@ where
                         //
                         self.seq += 1;
                         let _ = this.post(TIMEOUT(self.seq));
-                        self.sink.fifo.push(Notification::LEADING);
-                        self.sink.sem.signal();
+                        self.sink.push(Notification::LEADING);
+
                     }
                     (PREV(_), FLWR(ctx)) |
                     (CNDT(_), FLWR(ctx)) |
@@ -484,7 +471,7 @@ where
                     }
                 }
             }
-            Opcode::INPUT(TIMEOUT(seq)) if seq == self.seq => {
+            Opcode::CMD(TIMEOUT(seq)) if seq == self.seq => {
                 match state {
                     PREV(ref mut ctx) => {
 
@@ -499,7 +486,6 @@ where
                         ctx.pick = None;
                         for peer in &self.peers {
                             debug_assert!(*peer.0 != self.id);
-
                             let msg = PROBE {
                                 id: self.id,
                                 term: self.term + 1,
@@ -588,8 +574,7 @@ where
                             // - increment the sink semaphore
                             // - switch to PREVOTE to initiate a new election cycle
                             //
-                            self.sink.fifo.push(Notification::IDLE);
-                            self.sink.sem.signal();
+                            self.sink.push(Notification::IDLE);
                             return PREV(context::CNDT::default());
                         }
                     }
@@ -707,7 +692,7 @@ where
                     }
                 }
             }
-            Opcode::INPUT(STORE(bytes)) => {
+            Opcode::CMD(STORE(bytes)) => {
                 if let LEAD(ref ctx) = state {
 
                     //
@@ -734,7 +719,7 @@ where
                     }
                 }
             }
-            Opcode::INPUT(BYTES(raw)) => {
+            Opcode::CMD(BYTES(raw)) => {
                 trace!(
                     &self.logger,
                     "<- {}B from {} (code #{})",
@@ -770,8 +755,7 @@ where
                             // to synch us back?
                             //
                             self.term = msg.term;
-                            self.sink.fifo.push(Notification::IDLE);
-                            self.sink.sem.signal();
+                            self.sink.push(Notification::IDLE);
                             return FLWR(context::FLWR {
                                 live: false,
                                 leader: None,
@@ -805,8 +789,7 @@ where
                                     // - transition to FOLLOWER
                                     //
                                     self.term = msg.term;
-                                    self.sink.fifo.push(Notification::FOLLOWING);
-                                    self.sink.sem.signal();
+                                    self.sink.push(Notification::FOLLOWING);
                                     return FLWR(context::FLWR {
                                         live: false,
                                         leader: Some(msg.id),
@@ -826,8 +809,7 @@ where
                                         //   from no leader to one (e.g we started for instance)
                                         // - increment the sink semaphore
                                         //
-                                        self.sink.fifo.push(Notification::FOLLOWING);
-                                        self.sink.sem.signal();
+                                        self.sink.push(Notification::FOLLOWING);
                                     }
 
                                     //
@@ -881,8 +863,7 @@ where
                                                 self.snapshot.len()
                                             );
                                             self.log.flush().unwrap();
-                                            self.sink.fifo.push(Notification::CHECKPOINT(boundary));
-                                            self.sink.sem.signal();
+                                            self.sink.push(Notification::CHECKPOINT(boundary));
                                             self.tail = boundary;
                                         }
                                     }
@@ -898,8 +879,8 @@ where
                                     //
                                     self.term = msg.term;
                                     display!(self, "{:?}*| stepping down", ctx);
-                                    self.sink.fifo.push(Notification::FOLLOWING);
-                                    self.sink.sem.signal();
+                                    self.sink.push(Notification::FOLLOWING);
+
                                     return FLWR(context::FLWR {
                                         live: false,
                                         leader: Some(msg.id),
@@ -1150,8 +1131,7 @@ where
                                 for n in self.commit..smallest {
                                     let slot = read_slot!(self, n);
                                     (self.apply)(&mut guard, &slot.bytes);
-                                    self.sink.fifo.push(Notification::COMMIT(n, slot.bytes));
-                                    self.sink.sem.signal();
+                                    self.sink.push(Notification::COMMIT(n, slot.bytes));
                                 }
                                 drop(guard);
                                 self.commit = smallest;
@@ -1182,8 +1162,7 @@ where
                                     self.snapshot.clear();
                                     self.snapshot.append(&mut bytes);
                                     self.log.flush().unwrap();
-                                    self.sink.fifo.push(Notification::CHECKPOINT(boundary));
-                                    self.sink.sem.signal();
+                                    self.sink.push(Notification::CHECKPOINT(boundary));
                                     self.tail = boundary;
                                 }
                             }
@@ -1411,7 +1390,7 @@ where
                 //   all pending notifications and then move on
                 //
                 self.log.flush().unwrap();
-                self.sink.fifo.push(Notification::EXIT);
+                self.sink.push(Notification::EXIT);
                 self.sink.sem.disable();
             }
             _ => {}
@@ -1422,143 +1401,9 @@ where
 
 impl Raft {
 
-    /// Constructor method to spawn a new raft automaton. It returns a triplet made of the
-    /// automaton wrapper, a read-only lock on the automaton payload and a notification sink.
-    ///
-    /// The automaton is defined by a unique u8 identifier and a network destination
-    /// (e.g host+port). An optional set of seed peers may be specified. Binary buffers that need
-    /// to be sent to a given peer are passed to the `write` closure. It is up to the user to then
-    /// transmit those buffers depending on the implementation (socket, pipe, etc).
-    ///
-    /// The method is parameterized with the payload to use: the automaton will create and own this
-    /// payload. It will also update it upon each commit via the `apply` closure.
-    ///
-    pub fn spawn<'a, S, T, U, V: BuildHasher>(
-        guard: &Arc<Guard>,
-        id: u8,
-        mut peers: HashMap<u8, &'a str, V>,
-        write: S,
-        apply: T,
-        logger: Logger,
-    ) -> (Arc<Self>, Arc<ROLock<U>>, Arc<Sink>)
-    where
-        S: 'static + Send + Fn(&[u8; 32], &[u8]) -> (),
-        T: 'static + Send + Fn(&mut U, &[u8]) -> (),
-        U: 'static + Send + Default + Payload,
-    {
-        //
-        // - retrieve (and create upon the first invokation) our ancillary data, namely a shared
-        //   timer automaton use to fire timeout notifications
-        //
-        let global = ANCILLARY.run( || { 
-            Ancillary {timer: Arc::new(Timer::spawn(guard.clone())) }
-            });
-
-        //
-        // - turn the specified id/host mapping into our peer map
-        // - make sure to remove any entry that would be using our peer id
-        //
-        assert!(peers.len() < 64, "only 64 peers max are supported");
-        assert!(
-            id < peers.len() as u8,
-            "id={} but on {} peers are specified",
-            id,
-            peers.len()
-        );
-        assert!(
-            peers.contains_key(&id),
-            "{} not found in the specified map",
-            id
-        );
-        let host = Self::get_host(peers[&id]);
-        peers.retain(|&n, _| n != id);
-        let peers: HashMap<_, _> = peers
-            .iter()
-            .map(|(n, host)| {
-                (
-                    *n,
-                    Peer {
-                        host: Self::get_host(host),
-                        off: 1,
-                        ack: 1,
-                    },
-                )
-            })
-            .collect();
-
-        //
-        // - setup the log file
-        // - size it
-        //
-        let path = PathBuf::from(format!("log.{}", id));
-        let file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .open(&path)
-            .unwrap();
-        let off = FSM::<S, T, U>::RESOLUTION * FSM::<S, T, U>::SLOT_BYTES;
-        file.set_len(off as u64).unwrap();
-
-        //
-        // - create a notification sink
-        // - default the payload and wrap it in a RWLock
-        // - obtain a ROLock from it
-        // - start the automaton proper
-        //
-        let sink = Arc::new(Sink::new());
-        let payload = Arc::new(RWLock::from(Default::default()));
-        let lock = Arc::new(payload.read_only());
-        let fsm = Automaton::spawn(
-            guard.clone(),
-            Box::new(FSM {
-                id,
-                host,
-                seq: 0,
-                term: 0,
-                tail: 1,
-                head: 1,
-                age: 0,
-                commit: 1,
-                peers,
-                timer: global.timer.clone(),
-                log: unsafe { MmapMut::map_mut(&file).unwrap() },
-                sink: sink.clone(),
-                payload,
-                snapshot: Vec::new(),
-                write,
-                apply,
-                logger,
-            }),
-        );
-
-        (Arc::new(Self { fsm }), lock, sink)
-    }
-
-    #[inline]
-    pub fn get_host(tag: &str) -> [u8; 32] {
-        let mut buf = [0; 32];
-        let n = cmp::min(tag.len(), 32);
-        buf[..n].copy_from_slice(&tag.as_bytes()[..n]);
-        buf
-    }
-
     #[allow(dead_code)]
     pub fn drain(&self) -> () {
         self.fsm.drain();
-    }
-
-    #[allow(dead_code)]
-    pub fn feed(&self, bytes: &[u8]) -> () {
-
-        //
-        // - unpack the incoming byte stream
-        // - cast to a RAW
-        // - silently discard if invalid
-        //
-        if let Ok(raw) = deserialize(&bytes[..]) {
-            let _ = self.fsm.post(BYTES(raw));
-        }
     }
 
     #[allow(dead_code)]

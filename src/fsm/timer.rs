@@ -109,12 +109,12 @@ where
 {
     fn recv(
         &mut self,
-        _this: &Arc<Automaton<Command<T>>>,
+        _: &Arc<Automaton<Command<T>>>,
         state: State,
         opcode: Opcode<Command<T>, State>,
     ) -> State {
         match (state, opcode) {
-            (_, Opcode::INPUT(TICK)) => {
+            (_, Opcode::CMD(TICK)) => {
 
                 //
                 // - timer evaluation: the current tick in milliseconds is mapped to a
@@ -140,7 +140,7 @@ where
                     self.n = (self.n + 1) & (SLOTS - 1);
                 }
             }
-            (_, Opcode::INPUT(SCHEDULE(to, msg, lapse))) => {
+            (_, Opcode::CMD(SCHEDULE(to, msg, lapse))) => {
 
                 let (n, ms) = self.tick_to_slot(Instant::now() + lapse);
                 let slot = &mut self.slots[n];
@@ -204,8 +204,8 @@ where
 
         {
             //
-            // - allocate an internal thread that will periodically post a TICK
-            //   command back to the automaton
+            // - allocate an internal thread that will periodically post a TICK command back to
+            //   the automaton using a condvar
             //
             let fsm = fsm.clone();
             let _ = thread::spawn(move || {

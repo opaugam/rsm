@@ -1,85 +1,40 @@
+//! Decorator spawning a background streaming thread on top of one automaton. The function will
+//! only bind to the automaton on the first invokation (subsequent invokations have no effect).
+//! The incoming byte stream is interpreted as a sequence of varints encoding the number of bytes
+//! following them:
 //!
-use primitives::event::*;
-use primitives::rwlock::*;
-use raft::protocol::{Payload, Raft};
-use raft::sink::*;
-use slog::Logger;
-use std::collections::HashMap;
-use std::hash::BuildHasher;
-use std::io::{stdin, stdout, BufRead, Write};
+//!   |<--------- chunk #1 ------------> | <---- chunk #2 ----->| ...
+//!   | varint |         n bytes         | varint |   m bytes   | ...
+//!
+use fsm::automaton::*;
+use primitives::once::*;
+use std::io::{stdin, BufRead};
 use std::sync::Arc;
 use std::thread;
 
-///
-///
-///
-pub fn spawn<'a, S, T, U: BuildHasher>(
-    guard: &Arc<Guard>,
-    id: u8,
-    peers: HashMap<u8, &'a str, U>,
-    apply: S,
-    logger: Logger,
-) -> (Arc<Raft>, Arc<ROLock<T>>, Arc<Sink>)
+/// Internal once synchronizing the start of the streaming thread. There is no need to explicitely
+/// reset it and the thread can be left running til proces exit.
+static ANCILLARY: Once<()> = Once::new();
+
+#[inline]
+pub fn stream_from_sdtin<F, T>(fsm: &Arc<Automaton<T>>, deserialize: F) -> ()
 where
-    S: 'static + Send + Fn(&mut T, &[u8]) -> (),
-    T: 'static + Send + Default + Payload,
+    F: Fn(&[u8]) -> Option<T> + Sync + Send + 'static,
+    T: Send,
 {
-    let (raft, lock, sink) = {
-        Raft::spawn::<_, S, T, U>(
-            guard,
-            id,
-            peers,
-            move |host, bytes| {
-
-                //
-                // - lock STDOUT (not sure how to optimize this as the mutex guard
-                //   is not Send)
-                //
-                let stdout = stdout();
-                let mut pipe = stdout.lock();
-
-                //
-                // - encode the out buffer as the host identifier + the byte payload
-                // - the buffer is preceded by its byte size as a VARINT
-                // - the final layout is varint | host | bytes
-                //
-                let mut n = 1;
-                let mut left = 32 + bytes.len();
-                let mut preamble: [u8; 8] = [0; 8];
-                loop {
-                    let b = (left & 0x7F) as u8;
-                    left >>= 7;
-                    if left > 0 {
-                        preamble[n - 1] = b | 0x80;
-                        n += 1;
-                    } else {
-                        preamble[n - 1] = b;
-                        break;
-                    }
-                }
-
-                //
-                // - the wrapped line writer in stdout() will flush upon 0x0a (which is fine)
-                //
-                assert!(n > 0);
-                let _ = pipe.write(&preamble[..n]).unwrap();
-                let _ = pipe.write(&host[..]).unwrap();
-                let _ = pipe.write(&bytes[..]).unwrap();
-                let _ = pipe.flush();
-            },
-            apply,
-            logger,
-        )
-    };
-
     //
-    // - spawn an I/O thread to parse STDOUT
-    // - we stream in chunks of payload to forward them to the automaton
-    // - each chunk is preceded by its size in bytes encoded as a VARINT
-    // - please note this thread is not guarded, e.g will run til process exit (which is okay)
+    // - create upon the first invokation a thread to stream byte chunks from STDIN
+    // - the once does not hold onto any data nor do we use a termination event guard for this
+    //   thread as it is stateless and can be nuked with no side effect
     //
-    {
-        let raft = raft.clone();
+    let wrapped = Arc::new(deserialize);
+    let _ = ANCILLARY.run(move || {
+
+        //
+        // - we need to clone the arcs to avoid a captured outer variable error
+        //
+        let fsm = fsm.clone();
+        let wrapped = wrapped.clone();
         let _ = thread::spawn(move || {
 
             let mut off = 0;
@@ -120,17 +75,24 @@ where
                         }
 
                         if off > 0 {
-
-                            //
-                            // - we have a new chunk ready
-                            // - truncate our buffer
-                            //
                             if total >= off + chunk {
-                                raft.feed(&buf[off..off + chunk]);
+
+                                //
+                                // - we have a new chunk ready
+                                // - use the closure to either parse the bytes into a T or reject
+                                // - truncate our buffer and reset the offsets
+                                //
+                                if let Some(msg) = wrapped(&buf[off..off + chunk]) {
+                                    let _ = fsm.post(msg);
+                                }
                                 buf = buf.split_off(off + chunk);
                                 chunk = 0;
                                 off = 0;
                             } else {
+
+                                //
+                                // - we miss 1+ bytes, read more
+                                //
                                 break;
                             }
                         } else {
@@ -161,7 +123,5 @@ where
                 }
             }
         });
-    }
-
-    (raft, lock, sink)
+    });
 }

@@ -1,4 +1,5 @@
 pub mod automaton;
+pub mod io;
 pub mod mpsc;
 pub mod timer;
 
@@ -83,7 +84,7 @@ mod tests {
                             Duration::from_millis(250),
                         );
                     }
-                    (_, Opcode::INPUT(TERMINATE)) => {
+                    (_, Opcode::CMD(TERMINATE)) => {
                         this.drain();
                     }
                     _ => {}

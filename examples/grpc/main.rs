@@ -5,7 +5,6 @@ extern crate bincode;
 #[macro_use]
 extern crate clap;
 extern crate ctrlc;
-extern crate rand;
 extern crate rsm;
 #[macro_use]
 extern crate slog;
@@ -13,7 +12,6 @@ extern crate slog_async;
 extern crate slog_term;
 
 use rsm::primitives::event::*;
-use rsm::raft::io::pipe;
 use rsm::raft::protocol::Payload;
 use slog::{Drain, Level, LevelFilter, Logger};
 use slog_term::{FullFormat, PlainSyncDecorator};
@@ -75,13 +73,13 @@ fn main() {
     // - use a termination event
     // - the raft state machine will signal it when shutting down
     // - grab our node id
-    // - start a raft automaton using STDIN/STDOUT for network I/O
+    // - start a raft automaton using STDIN/STDOUT as I/O
     // - the automaton is passed an empty payload
     //
     let event = Arc::new(Event::new());
     let guard = event.guard();
     let id = value_t!(args, "ID", u8).unwrap();
-    let (raft, _, _) = pipe::spawn::<_, Empty, _>(
+    let (raft, _, _) = rsm::raft::spawn_piped::<_, Empty, _>(
         &guard,
         id,
         peers,
@@ -97,10 +95,10 @@ fn main() {
         ctrlc::set_handler(move || {
 
             //
-            // - terminate the ancillary threads for raft::protocol
-            // - drain the raft automaton
+            // - drop the ancillary data for rsm::raft
+            // - drain the automaton
             //
-            rsm::raft::protocol::ANCILLARY.reset();
+            rsm::raft::ANCILLARY.reset();
             raft.drain();
 
         }).unwrap();

@@ -115,7 +115,7 @@ fn main() {
             let (raft, _, sink) = {
                 let guard = guard.clone();
                 let shared = shared.clone();
-                Raft::spawn::<_, _, COUNTER, _>(
+                rsm::raft::spawn::<_, _, COUNTER, _>(
                     &guard,
                     id,
                     seeds,
@@ -215,9 +215,9 @@ fn main() {
         ctrlc::set_handler(move || {
 
             //
-            // - terminate the ancillary threads for raft::protocol
+            // - drop the ancillary data for rsm::raft
             //
-            rsm::raft::protocol::ANCILLARY.reset();
+            rsm::raft::ANCILLARY.reset();
 
             //
             // - terminate the automata one by one

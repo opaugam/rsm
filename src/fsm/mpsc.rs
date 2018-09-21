@@ -1,4 +1,4 @@
-//! Basic MPSC queue. Also for more interesting ideas check out the
+//! Basic MPSC queue with no cap. Also for more interesting ideas check out the
 //! [1024cores blob](http://www.1024cores.net/home/lock-free-algorithms/queues).
 use std::boxed::Box;
 use std::cell::UnsafeCell;
@@ -99,14 +99,14 @@ impl<T> MPSC<T> {
     pub fn pop(&self) -> Result<T, Errors> {
         unsafe {
             loop {
-                let tail = *self.tail.get();
 
                 //
                 // - atomic read
                 // - since pop() is assumed to be called from one thread at once..
-                // - .. the node to the left of the tail cannot be updated
+                // - ..the node to the left of the tail cannot be updated
                 // - the only possibilty being a queue of size 0 being updated with a new node
                 //
+                let tail = *self.tail.get();
                 let prv = (*tail).prv.load(Ordering::Acquire);
                 if !prv.is_null() {
 
@@ -116,8 +116,8 @@ impl<T> MPSC<T> {
                     // - consume that node value
                     //
                     *self.tail.get() = prv;
-                    assert!((*tail).val.is_none());
-                    assert!((*prv).val.is_some());
+                    debug_assert!((*tail).val.is_none());
+                    debug_assert!((*prv).val.is_some());
 
                     //
                     // - release the tail node via a ::from_raw() + drop checker

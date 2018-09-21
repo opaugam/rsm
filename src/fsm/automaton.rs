@@ -29,7 +29,7 @@ where
     U: PartialEq,
 {
     START,
-    INPUT(T),
+    CMD(T),
     TRANSITION(U),
     DRAIN,
     EXIT,
@@ -118,10 +118,10 @@ where
 
                         //
                         // - we dequeued the next command
-                        // - recv() on INPUT and optional on TRANSITION if the
-                        //   state is deemed differnt (see below)
+                        // - recv() on CMD and optional on TRANSITION if the
+                        //   state is deemed different (see below)
                         //
-                        let next = body.recv(&fsm, state, INPUT(msg));
+                        let next = body.recv(&fsm, state, CMD(msg));
                         if next != state {
                             body.recv(&fsm, next, TRANSITION(state));
                         }
@@ -141,6 +141,7 @@ where
                         // - we're done, exit the processing loop
                         //
                         fsm.mode.fetch_add(1, Ordering::Release);
+                        println!("posting EXIT");
                         let _ = body.recv(&fsm, state, EXIT);
                         break;
 
@@ -160,6 +161,8 @@ where
                 // - exit the thread
                 //
                 drop(guard);
+                println!("exiting thread");
+
             });
         }
         fsm.start();

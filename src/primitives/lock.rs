@@ -28,10 +28,9 @@ const LOCK: usize = 1;
 const BUSY: usize = 2;
 const PENDING: usize = 4;
 
-/// Raw lock storing its state in a atomic usize and maintaining a parking
-/// queue according to the specified strategy. The lock is able to carry user
-/// payload (as a u32) as well as a counter tracking the number of pending
-/// threads (maximum queue of 16M threads).
+/// Raw lock storing its state in a atomic usize and maintaining a parking queue according to the
+/// specified strategy. The lock is able to carry user payload (as a u32) as well as a counter
+/// tracking the number of pending threads (maximum queue of 16M threads).
 ///
 /// The state usize is laid out as follows:
 ///
