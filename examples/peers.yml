@@ -1,0 +1,9 @@
+#
+# - sample configuration file used by the gRPC python frontend
+# - each entry in the array is a peer running on localhost with a sequential index (e.g
+#   the first entry is peer #0)
+#
+
+- 127.0.0.1:9000
+- 127.0.0.1:9001
+- 127.0.0.1:9002

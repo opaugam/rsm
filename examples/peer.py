@@ -20,10 +20,20 @@ import api_pb2
 import api_pb2_grpc
 
 """
-CLI gRPC front-end for a RSM automaton using STDIN/STDOUT pipes as line buffers. The automaton
-itself is an executable invoked using subprocess. This pattern allows for building quickly the
-network I/O frontend outside of the Rust code. It is also convenient to parse configuration
-files, etc.
+CLI gRPC front-end for a rust executable using STDIN/STDOUT pipes as line buffers. The executable
+is invoked using subprocess with piping enabled. This pattern allows for building quickly and
+isolate the network I/O frontend outside of the core logic. It is also convenient for other tedious
+tasks such as parsing configuration files, etc.
+
+The stream layout is as follows:
+
+   |<--------- chunk #1 ------------> | <---- chunk #2 ----->| ...
+   | varint |         n bytes         | varint |   m bytes   | ...
+
+Each byte chunk is left to be interpreted by the subprocess (typically a raft automaton).
+
+A simple "peers.yml" YAML config file is used to pass 1+ peer coordinates (similar to the Apache
+Zookeeper configuration).
 """
 
 def _to_varint(n):
@@ -57,6 +67,7 @@ def _from_varint(buf):
 if __name__ == "__main__":
 
     parser = argparse.ArgumentParser(description='node.py', prefix_chars='-')
+    parser.add_argument('executable', type=str, nargs=1, help='executable to subprocess')
     parser.add_argument('--id', type=int, required=True, help='peer ID')
     args = parser.parse_args()
         
@@ -134,7 +145,7 @@ if __name__ == "__main__":
         # - find our host:port
         #
         try:
-            with open('%s/cluster.yml' % pwd, 'rb') as fd:
+            with open('%s/peers.yml' % pwd, 'rb') as fd:
                 peers = yaml.load(fd)
                 assert type(peers) is list, 'invalid YAML layout'
                 host = peers[args.id]
@@ -158,11 +169,11 @@ if __name__ == "__main__":
         # - make sure to pipe STDIN/STDOUT
         # - spawn the STDOUT thread (e.g outgoing traffic)
         #
-        snippet = '%s/../../target/debug/grpc --id %d %s' % (pwd, args.id, ' '.join(peers))
+        snippet = '%s --id %d %s' % (args.executable[0], args.id, ' '.join(peers))
         try:
             pid = Popen(snippet.split(' '), stdin=PIPE, stdout=PIPE, env={'RUST_BACKTRACE': 'full'})
         except OSError:
-            assert 0, 'executable not built, run "cargo build --bin grpc" first'
+            assert 0, 'executable not found' 
 
         tid = Thread(target=_read, args=(pid,))
         tid.daemon = True

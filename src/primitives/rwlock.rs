@@ -26,8 +26,11 @@ pub struct ROLock<T> {
 }
 
 unsafe impl<T> Send for RWLock<T> {}
+
 unsafe impl<T> Sync for RWLock<T> {}
+
 unsafe impl<T> Send for ROLock<T> {}
+
 unsafe impl<T> Sync for ROLock<T> {}
 
 pub struct ReadGuard<'a, T>

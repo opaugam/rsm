@@ -18,6 +18,7 @@ direct acknowledgement.
    semaphore, events and more!
  * Basic finite state-machine automata, great for building actor systems!
  * Fast [**Raft**](https://raft.github.io/) protocol 100% implemented as an automaton.
+ * Convenient [**Python**](https://www.python.org/) frontend to act as a network I/O proxy.
 
 Please note this is still a *work in progress* I am working on regularly. It is a great educational
 resource for whoever wants to learn how things like locks or finite state-machine work. It is not yet
@@ -35,10 +36,10 @@ have python and grpc installed):
 
 ```
 $ cargo build --bin grpc
-$ cd examples/grpc
+$ cd examples
 $ mkdir api
 $ python -m grpc_tools.protoc -I. --python_out=./api --grpc_python_out=./api api.proto
-$ python peer.py --id 0
+$ python peer.py ../target/debug/grpc --id 0
 ```
 
 Et voila, a raft peer is up and running ready to communicate to form a cluster!
